@@ -6,8 +6,6 @@ A free and open source physical media backup utility.
 
 ## Quick start
 
-Insert a disc, then run:
-
 ```sh
 packrat
 ```

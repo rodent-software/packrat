@@ -35,22 +35,19 @@ use crate::{resolve_naming, Naming};
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Kaomoji frames for the header mouse. `RAT_IDLE` is the base pose; the
-/// others animate the tail, blink, ear, snout, or the load it carries. Each
-/// frame is three lines; the renderer pads them to a common width so the
-/// ambiguous-width glyphs cannot shift the art.
+/// others blink, flick an ear, sniff, or carry a load. The tail stays put —
+/// swapping multi-cell glyphs cannot interpolate smoothly. Each frame is three
+/// lines; the renderer pads them to a common width so the ambiguous-width
+/// glyphs cannot shift the art.
 const RAT_IDLE: [&str; 3] = ["　C・プ", "＼(　）", "　　｀｀"];
-const RAT_TAIL_UP: [&str; 3] = ["　C・プ", "｜(　）", "　　｀｀"];
-const RAT_TAIL_LOW: [&str; 3] = ["　C・プ", "／(　）", "　　｀｀"];
-const RAT_BLINK: [&str; 3] = ["　C・－", "＼(　）", "　　｀｀"];
+const RAT_BLINK: [&str; 3] = ["　C－プ", "＼(　）", "　　｀｀"];
 const RAT_EAR: [&str; 3] = ["　^・プ", "＼(　）", "　　｀｀"];
 const RAT_SNIFF: [&str; 3] = ["　C・プ｡", "＼(　）", "　　｀｀"];
 const RAT_PACK: [&str; 3] = ["　C・プ", "＼(▣ ）", "　　｀｀"];
-const RAT_PACK_UP: [&str; 3] = ["　C・プ", "｜(▣ ）", "　　｀｀"];
-const RAT_PACK_LOW: [&str; 3] = ["　C・プ", "／(▣ ）", "　　｀｀"];
+const RAT_PACK_BLINK: [&str; 3] = ["　C－プ", "＼(▣ ）", "　　｀｀"];
 const RAT_CHEESE: [&str; 3] = ["　C・プ■■", "＼(　）", "　　｀｀"];
-const RAT_CHEESE_UP: [&str; 3] = ["　C・プ■■", "｜(　）", "　　｀｀"];
-const RAT_CHEESE_LOW: [&str; 3] = ["　C・プ■■", "／(　）", "　　｀｀"];
-const RAT_SURPRISED: [&str; 3] = ["　C・o", "＼(　）", "　　｀｀"];
+const RAT_CHEESE_BLINK: [&str; 3] = ["　C－プ■■", "＼(　）", "　　｀｀"];
+const RAT_ERROR: [&str; 3] = ["　Cｘプ", "＼(　）", "　　｀｀"];
 
 /// Plain-ASCII fallback for terminals without the wide glyphs.
 const RAT_ASCII: [[&str; 3]; 3] = [
@@ -917,13 +914,14 @@ impl App {
     }
 
     /// The kaomoji pose the header mouse holds for the current stage: sniffing
-    /// while it looks for a disc, tail-wagging during review, hauling the pack
-    /// while backing up, and pleased with its cheese when finished.
+    /// while it looks for a disc, idling with an occasional blink or ear flick
+    /// during review, hauling the pack while backing up, pleased with its
+    /// cheese when finished, and cross-eyed when something goes wrong.
     fn rat_frame(&self) -> &'static [&'static str; 3] {
         match self.stage {
             Stage::Detect => {
                 if self.detect_note.is_some() {
-                    &RAT_SURPRISED
+                    &RAT_ERROR
                 } else if (self.tick / 5) % 2 == 0 {
                     &RAT_SNIFF
                 } else {
@@ -933,26 +931,27 @@ impl App {
             Stage::Plan => {
                 const CYCLE: [&[&str; 3]; 8] = [
                     &RAT_IDLE,
-                    &RAT_TAIL_UP,
-                    &RAT_IDLE,
-                    &RAT_TAIL_LOW,
                     &RAT_IDLE,
                     &RAT_BLINK,
                     &RAT_IDLE,
+                    &RAT_IDLE,
+                    &RAT_IDLE,
                     &RAT_EAR,
+                    &RAT_IDLE,
                 ];
                 CYCLE[(self.tick / 3) % CYCLE.len()]
             }
             Stage::Ripping => {
-                const CYCLE: [&[&str; 3]; 3] = [&RAT_PACK_UP, &RAT_PACK, &RAT_PACK_LOW];
-                CYCLE[(self.tick / 2) % CYCLE.len()]
+                const CYCLE: [&[&str; 3]; 4] =
+                    [&RAT_PACK, &RAT_PACK, &RAT_PACK_BLINK, &RAT_PACK];
+                CYCLE[(self.tick / 3) % CYCLE.len()]
             }
             Stage::Done => {
                 if self.failed > 0 {
-                    &RAT_SURPRISED
+                    &RAT_ERROR
                 } else {
                     const CYCLE: [&[&str; 3]; 4] =
-                        [&RAT_CHEESE, &RAT_CHEESE_UP, &RAT_CHEESE, &RAT_CHEESE_LOW];
+                        [&RAT_CHEESE, &RAT_CHEESE, &RAT_CHEESE_BLINK, &RAT_CHEESE];
                     CYCLE[(self.tick / 3) % CYCLE.len()]
                 }
             }
@@ -2135,18 +2134,28 @@ mod tests {
         app.stage = Stage::Plan;
         app.tick = 0;
         assert_eq!(*app.rat_frame(), RAT_IDLE);
-        app.tick = 3;
-        assert_eq!(*app.rat_frame(), RAT_TAIL_UP);
+        app.tick = 6; // blink frame
+        assert_eq!(*app.rat_frame(), RAT_BLINK);
+        app.tick = 18; // ear-flick frame
+        assert_eq!(*app.rat_frame(), RAT_EAR);
 
         app.stage = Stage::Ripping;
         app.tick = 0;
-        assert_eq!(*app.rat_frame(), RAT_PACK_UP);
+        assert_eq!(*app.rat_frame(), RAT_PACK);
+        app.tick = 6; // blink frame
+        assert_eq!(*app.rat_frame(), RAT_PACK_BLINK);
 
         app.stage = Stage::Done;
         app.tick = 0;
         assert_eq!(*app.rat_frame(), RAT_CHEESE);
+        app.tick = 6;
+        assert_eq!(*app.rat_frame(), RAT_CHEESE_BLINK);
+
+        // Errors cross the eye rather than changing the nose.
         app.failed = 1;
-        assert_eq!(*app.rat_frame(), RAT_SURPRISED);
+        assert_eq!(*app.rat_frame(), RAT_ERROR);
+        assert!(app.rat_frame()[0].contains('ｘ'));
+        assert!(app.rat_frame()[0].contains('プ'));
     }
 
     #[test]

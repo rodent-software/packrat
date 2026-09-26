@@ -70,6 +70,176 @@ const RAT_FRAMES: [[&str; 3]; 6] = [
     ],
 ];
 
+/// Pixel art for the rat, one char per pixel (`rat_pixel` maps the palette;
+/// `.` is transparent). Each frame is 36x16, which the header turns into 18x4
+/// Braille cells with a truecolour average per cell. The tail sways, the feet
+/// alternate, and frame 3 blinks.
+const RAT_PIXELS: [[&str; 16]; 6] = [
+    [
+        ".......................pppp.........",
+        "..ttt.................pppppp........",
+        ".t...................pppPPppp.......",
+        ".t...................ppPPPPpp.......",
+        ".t...................ppPPPPpp.......",
+        ".t.......ggggggggg.ggpppPPppp.......",
+        ".tt....gggggggggggggggpppppwkk......",
+        "..t...gggggggggggggggggppppkkkg.....",
+        "...ttggggggggggggggggggggggkkkggggP.",
+        ".....ggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gdddgggggdddgggggg.........",
+        ".........ddddd...ddddd..............",
+        "..........ddd.....ddd...............",
+    ],
+    [
+        ".......................pppp.........",
+        "......................pppppp........",
+        ".t...................pppPPppp.......",
+        "t....................ppPPPPpp.......",
+        "t....................ppPPPPpp.......",
+        "t........ggggggggg.ggpppPPppp.......",
+        "t......gggggggggggggggpppppwkk......",
+        ".t....gggggggggggggggggppppkkkg.....",
+        "..tttggggggggggggggggggggggkkkggggP.",
+        ".....ggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gddddggggddddggggg.........",
+        "..........dddd....dddd..............",
+        "..........dddd....dddd..............",
+    ],
+    [
+        ".......................pppp.........",
+        "......................pppppp........",
+        ".....................pppPPppp.......",
+        "t....................ppPPPPpp.......",
+        "t....................ppPPPPpp.......",
+        "t........ggggggggg.ggpppPPppp.......",
+        "t......gggggggggggggggpppppwkk......",
+        "t.....gggggggggggggggggppppkkkg.....",
+        "t....ggggggggggggggggggggggkkkggggP.",
+        ".ttttggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gdddgggggdddgggggg.........",
+        ".........ddddd...ddddd..............",
+        "..........ddd.....ddd...............",
+    ],
+    [
+        ".......................pppp.........",
+        "..ttt.................pppppp........",
+        ".t...................pppPPppp.......",
+        ".t...................ppPPPPpp.......",
+        ".t...................ppPPPPpp.......",
+        ".t.......ggggggggg.ggpppPPppp.......",
+        ".tt....gggggggggggggggppppppgg......",
+        "..t...gggggggggggggggggppppgggg.....",
+        "...ttgggggggggggggggggggggggggggggP.",
+        ".....ggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gddddggggddddggggg.........",
+        "..........dddd....dddd..............",
+        "..........dddd....dddd..............",
+    ],
+    [
+        ".......................pppp.........",
+        "..ttt.................pppppp........",
+        ".t...................pppPPppp.......",
+        ".t...................ppPPPPpp.......",
+        ".t...................ppPPPPpp.......",
+        ".t.......ggggggggg.ggpppPPppp.......",
+        ".tt....gggggggggggggggpppppwkk......",
+        "..t...gggggggggggggggggppppkkkg.....",
+        "...ttggggggggggggggggggggggkkkggggP.",
+        ".....ggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gdddgggggdddgggggg.........",
+        ".........ddddd...ddddd..............",
+        "..........ddd.....ddd...............",
+    ],
+    [
+        ".......................pppp.........",
+        "......................pppppp........",
+        ".....................pppPPppp.......",
+        "t....................ppPPPPpp.......",
+        "t....................ppPPPPpp.......",
+        "t........ggggggggg.ggpppPPppp.......",
+        "t......gggggggggggggggpppppwkk......",
+        "t.....gggggggggggggggggppppkkkg.....",
+        "t....ggggggggggggggggggggggkkkggggP.",
+        ".ttttggggglllllllgggggggggggggggggPg",
+        ".....ggglllllllllggggggggggggggggg..",
+        "......ggllllllllllggggggggggggg.....",
+        ".......gggllllllllggggggggggg.......",
+        ".........gddddggggddddggggg.........",
+        "..........dddd....dddd..............",
+        "..........dddd....dddd..............",
+    ],
+];
+
+/// Palette for [`RAT_PIXELS`]. `None` means transparent.
+fn rat_pixel(c: char) -> Option<(u8, u8, u8)> {
+    Some(match c {
+        'g' => (150, 150, 158),
+        'l' => (200, 200, 208),
+        'd' => (96, 96, 108),
+        'p' => (230, 152, 174),
+        'P' => (206, 116, 142),
+        'k' => (18, 18, 24),
+        'w' => (244, 244, 248),
+        't' => (188, 166, 176),
+        _ => return None,
+    })
+}
+
+/// Render one [`RAT_PIXELS`] frame as four rows of Braille cells. Each cell
+/// covers a 2x4 block and takes the average colour of the pixels it lights.
+fn rat_braille_lines(frame: &[&str; 16]) -> Vec<Line<'static>> {
+    /// Braille dot bit for a pixel at `(dx, dy)` inside a 2x4 cell.
+    const BITS: [[u32; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+    let mut lines = Vec::with_capacity(4);
+    for cy in 0..4 {
+        let mut spans = Vec::with_capacity(18);
+        for cx in 0..18 {
+            let mut code = 0u32;
+            let (mut red, mut green, mut blue, mut count) = (0u32, 0u32, 0u32, 0u32);
+            for dy in 0..4 {
+                for dx in 0..2 {
+                    let ch = frame[cy * 4 + dy].as_bytes()[cx * 2 + dx] as char;
+                    if let Some((r, g, b)) = rat_pixel(ch) {
+                        code |= BITS[dy][dx];
+                        red += u32::from(r);
+                        green += u32::from(g);
+                        blue += u32::from(b);
+                        count += 1;
+                    }
+                }
+            }
+            if code == 0 || count == 0 {
+                spans.push(Span::raw(" "));
+            } else {
+                let colour = Color::Rgb(
+                    (red / count) as u8,
+                    (green / count) as u8,
+                    (blue / count) as u8,
+                );
+                let glyph = char::from_u32(0x2800 + code).unwrap_or(' ').to_string();
+                spans.push(Span::styled(glyph, Style::default().fg(colour)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 /// Launch the interactive flow. Returns once the user quits.
 pub fn run() -> Result<()> {
     // If we panic while the terminal is in raw mode, put it back first.
@@ -884,9 +1054,9 @@ impl App {
 
     fn ui(&self, f: &mut Frame) {
         let area = f.area();
-        // Leave room for the three-row header rat, but keep the body usable on
-        // short terminals.
-        let header_height = if area.height >= 10 { 3 } else { 1 };
+        // Leave room for the four-row Braille rat, but keep the body usable on
+        // short terminals (which get the compact ASCII rat instead).
+        let header_height = if area.height >= 12 { 4 } else { 1 };
         let rows = Layout::vertical([
             Constraint::Length(header_height),
             Constraint::Min(0),
@@ -923,8 +1093,8 @@ impl App {
             Span::styled(format!("  {where_}"), Style::default().fg(Color::DarkGray)),
         ]);
 
-        let frame = &RAT_FRAMES[(self.tick / 3) % RAT_FRAMES.len()];
-        let rat_width = frame[0].len() as u16;
+        let frame_index = (self.tick / 3) % RAT_PIXELS.len();
+        let rat_width = (RAT_PIXELS[0][0].len() / 2) as u16;
         if area.width <= rat_width {
             f.render_widget(Paragraph::new(badge), area);
             return;
@@ -932,25 +1102,25 @@ impl App {
 
         let cols =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
-        if area.height >= 3 {
-            // Vertically centre the badge against the three-row rat.
+        if area.height >= 4 {
+            // Braille sprite with one truecolour per 2x4 cell.
             let text_area = Rect {
-                y: area.y + area.height / 2,
+                y: area.y + (area.height - 1) / 2,
                 height: 1,
                 ..cols[0]
             };
             f.render_widget(Paragraph::new(badge), text_area);
-
-            let lines: Vec<Line> = frame
-                .iter()
-                .map(|row| Line::from(Span::styled(*row, Style::default().fg(Color::Gray))))
-                .collect();
-            f.render_widget(Paragraph::new(lines).alignment(Alignment::Right), cols[1]);
-        } else {
-            // Compact terminals get the rat's middle row only.
-            f.render_widget(Paragraph::new(badge), cols[0]);
             f.render_widget(
-                Paragraph::new(frame[1])
+                Paragraph::new(rat_braille_lines(&RAT_PIXELS[frame_index]))
+                    .alignment(Alignment::Right),
+                cols[1],
+            );
+        } else {
+            // Compact terminals get the ASCII rat's middle row only.
+            f.render_widget(Paragraph::new(badge), cols[0]);
+            let ascii = &RAT_FRAMES[frame_index % RAT_FRAMES.len()];
+            f.render_widget(
+                Paragraph::new(ascii[1])
                     .style(Style::default().fg(Color::Gray))
                     .alignment(Alignment::Right),
                 cols[1],
@@ -2016,12 +2186,12 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_an_animated_rat() {
+    fn header_shows_an_animated_braille_rat() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut app = App::initial();
-        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(50, 16)).unwrap();
         let rows = |app: &App, terminal: &mut Terminal<TestBackend>| {
             terminal.draw(|frame| app.ui(frame)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -2037,16 +2207,48 @@ mod tests {
 
         app.tick = 0;
         let now = rows(&app, &mut terminal);
-        // Three-row sprite: head on the middle row, feet and tail below.
-        assert!(now[1].contains("<o,o)___"), "expected the rat: {:?}", now[1]);
-        assert!(now[2].contains(")~~~"), "expected a tail: {:?}", now[2]);
-
-        app.tick = 6; // tick / 3 == 2, the blink frame
-        let blinked = rows(&app, &mut terminal);
         assert!(
-            blinked[1].contains("<o,-)___"),
-            "expected a blink: {:?}",
-            blinked[1]
+            now[..4]
+                .iter()
+                .any(|row| row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))),
+            "expected a Braille rat in the header: {:?}",
+            &now[..4]
+        );
+
+        // The cells carry a truecolour foreground, not just the default style.
+        {
+            let buffer = terminal.backend().buffer();
+            let has_rgb = (0..4).any(|y| {
+                (0..buffer.area.width).any(|x| matches!(buffer[(x, y)].fg, Color::Rgb(..)))
+            });
+            assert!(has_rgb, "expected truecolour rat cells");
+        }
+
+        app.tick = 9; // tick / 3 == 3, the blink frame
+        let blinked = rows(&app, &mut terminal);
+        assert_ne!(
+            now[..4].concat(),
+            blinked[..4].concat(),
+            "the rat should animate"
+        );
+    }
+
+    #[test]
+    fn header_falls_back_to_ascii_on_short_terminals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        let mut terminal = Terminal::new(TestBackend::new(50, 8)).unwrap();
+        app.tick = 0;
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(
+            row.contains("<o,o)"),
+            "expected the compact ASCII rat: {row:?}"
         );
     }
 }

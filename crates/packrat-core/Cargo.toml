@@ -1,0 +1,20 @@
+[package]
+name = "packrat-core"
+description = "Core disc-reading, detection and ripping logic for packrat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+oxideav-dvd.workspace = true
+oxideav-mkv.workspace = true
+oxideav-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[features]
+# Link libdvdcss for CSS decryption on raw optical devices.
+dvdcss = []

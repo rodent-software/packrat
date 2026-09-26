@@ -1,0 +1,21 @@
+[package]
+name = "packrat-cli"
+description = "Command-line interface for packrat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "packrat"
+path = "src/main.rs"
+
+[dependencies]
+packrat-core = { path = "../packrat-core" }
+anyhow.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+
+[features]
+# Enable libdvdcss-backed CSS decryption for raw devices.
+dvdcss = ["packrat-core/dvdcss"]

@@ -1,0 +1,19 @@
+# Rust build output
+/target
+**/target
+
+# Project-local cargo home (used to keep the registry inside the workspace)
+/.cargo-home
+
+# Scratch experiments
+/.scratch
+
+# Partial/ripped output must never look like finished media
+*.partial
+
+# Local rip output
+/out
+
+# mdBook build output and locally installed docs tooling
+/book
+/.docs-tools

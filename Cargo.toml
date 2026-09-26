@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/packrat-core", "crates/packrat-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+ratatui = "0.29"
+
+# Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
+oxideav-dvd = "0.0.4"
+# Pure-Rust Matroska reader/writer, codec-agnostic.
+oxideav-mkv = "0.0.10"
+# Shared media types (Packet / StreamInfo / CodecParameters) used by the muxer API.
+oxideav-core = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

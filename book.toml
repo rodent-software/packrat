@@ -1,0 +1,10 @@
+[book]
+title = "packrat"
+description = "A free and open source physical media backup utility."
+authors = ["packrat contributors"]
+language = "en"
+src = "docs"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "coal"

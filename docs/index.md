@@ -2,6 +2,8 @@
 
 A free and open source physical media backup utility.
 
+![The packrat interactive guide](assets/preview.png)
+
 ## Quick start
 
 Insert a disc, then run:

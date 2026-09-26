@@ -34,17 +34,40 @@ use crate::{resolve_naming, Naming};
 /// Spinner frames used while a background task runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// A small rat that scampers in the top-right of the header. The frames are
-/// all the same width; alternating tail lengths wag it and one frame blinks.
-const RAT_FRAMES: [&str; 8] = [
-    " <:3 )~~~ ",
-    " <:3 )~~  ",
-    " <:3 )~   ",
-    " <;3 )~~  ",
-    " <:3 )~~~ ",
-    " <:3 )~~~~",
-    " <:3 )~~~ ",
-    " <:3 )~~  ",
+/// A small rat that scurries in the top-right of the header. Each frame is
+/// three rows tall and every row is the same width: the feet run, the tail
+/// wags, and one frame blinks.
+const RAT_FRAMES: [[&str; 3]; 6] = [
+    [
+        "   __         ",
+        "  <o,o)___    ",
+        "   ^   ^ )~~~ ",
+    ],
+    [
+        "   __         ",
+        "  <o,o)___    ",
+        "    ^ ^  )~~  ",
+    ],
+    [
+        "   __         ",
+        "  <o,-)___    ",
+        "   ^   ^ )~   ",
+    ],
+    [
+        "   __         ",
+        "  <o,o)___    ",
+        "    ^ ^  )~~~ ",
+    ],
+    [
+        "   __         ",
+        "  <o,o)___    ",
+        "   ^   ^ )~~  ",
+    ],
+    [
+        "   __         ",
+        "  <o,o)___    ",
+        "    ^ ^  )~~~ ",
+    ],
 ];
 
 /// Launch the interactive flow. Returns once the user quits.
@@ -861,8 +884,11 @@ impl App {
 
     fn ui(&self, f: &mut Frame) {
         let area = f.area();
+        // Leave room for the three-row header rat, but keep the body usable on
+        // short terminals.
+        let header_height = if area.height >= 10 { 3 } else { 1 };
         let rows = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(header_height),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -889,7 +915,7 @@ impl App {
             Stage::Ripping => "backing up",
             Stage::Done => "finished",
         };
-        let line = Line::from(vec![
+        let badge = Line::from(vec![
             Span::styled(
                 " packrat ",
                 Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
@@ -897,21 +923,38 @@ impl App {
             Span::styled(format!("  {where_}"), Style::default().fg(Color::DarkGray)),
         ]);
 
-        // A small rat scampers in the top-right corner.
-        let rat_width = RAT_FRAMES[0].len() as u16;
-        if area.width > rat_width {
-            let cols =
-                Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
-            f.render_widget(Paragraph::new(line), cols[0]);
-            let frame = RAT_FRAMES[(self.tick / 3) % RAT_FRAMES.len()];
+        let frame = &RAT_FRAMES[(self.tick / 3) % RAT_FRAMES.len()];
+        let rat_width = frame[0].len() as u16;
+        if area.width <= rat_width {
+            f.render_widget(Paragraph::new(badge), area);
+            return;
+        }
+
+        let cols =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
+        if area.height >= 3 {
+            // Vertically centre the badge against the three-row rat.
+            let text_area = Rect {
+                y: area.y + area.height / 2,
+                height: 1,
+                ..cols[0]
+            };
+            f.render_widget(Paragraph::new(badge), text_area);
+
+            let lines: Vec<Line> = frame
+                .iter()
+                .map(|row| Line::from(Span::styled(*row, Style::default().fg(Color::Gray))))
+                .collect();
+            f.render_widget(Paragraph::new(lines).alignment(Alignment::Right), cols[1]);
+        } else {
+            // Compact terminals get the rat's middle row only.
+            f.render_widget(Paragraph::new(badge), cols[0]);
             f.render_widget(
-                Paragraph::new(frame)
+                Paragraph::new(frame[1])
                     .style(Style::default().fg(Color::Gray))
                     .alignment(Alignment::Right),
                 cols[1],
             );
-        } else {
-            f.render_widget(Paragraph::new(line), area);
         }
     }
 
@@ -1978,21 +2021,32 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::initial();
-        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        let header = |app: &App, terminal: &mut Terminal<TestBackend>| {
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        let rows = |app: &App, terminal: &mut Terminal<TestBackend>| {
             terminal.draw(|frame| app.ui(frame)).unwrap();
             let buffer = terminal.backend().buffer();
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, 0)].symbol())
-                .collect::<String>()
+            let (width, height) = (buffer.area.width, buffer.area.height);
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
         };
 
         app.tick = 0;
-        let first = header(&app, &mut terminal);
-        assert!(first.contains("<:3 )~~~"), "expected the rat: {first:?}");
+        let now = rows(&app, &mut terminal);
+        // Three-row sprite: head on the middle row, feet and tail below.
+        assert!(now[1].contains("<o,o)___"), "expected the rat: {:?}", now[1]);
+        assert!(now[2].contains(")~~~"), "expected a tail: {:?}", now[2]);
 
-        app.tick = 9; // tick / 3 == 3, the blink frame
-        let blinked = header(&app, &mut terminal);
-        assert!(blinked.contains("<;3"), "expected a blink: {blinked:?}");
+        app.tick = 6; // tick / 3 == 2, the blink frame
+        let blinked = rows(&app, &mut terminal);
+        assert!(
+            blinked[1].contains("<o,-)___"),
+            "expected a blink: {:?}",
+            blinked[1]
+        );
     }
 }

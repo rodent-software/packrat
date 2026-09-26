@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
@@ -33,6 +33,19 @@ use crate::{resolve_naming, Naming};
 
 /// Spinner frames used while a background task runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// A small rat that scampers in the top-right of the header. The frames are
+/// all the same width; alternating tail lengths wag it and one frame blinks.
+const RAT_FRAMES: [&str; 8] = [
+    " <:3 )~~~ ",
+    " <:3 )~~  ",
+    " <:3 )~   ",
+    " <;3 )~~  ",
+    " <:3 )~~~ ",
+    " <:3 )~~~~",
+    " <:3 )~~~ ",
+    " <:3 )~~  ",
+];
 
 /// Launch the interactive flow. Returns once the user quits.
 pub fn run() -> Result<()> {
@@ -883,7 +896,23 @@ impl App {
             ),
             Span::styled(format!("  {where_}"), Style::default().fg(Color::DarkGray)),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+
+        // A small rat scampers in the top-right corner.
+        let rat_width = RAT_FRAMES[0].len() as u16;
+        if area.width > rat_width {
+            let cols =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
+            f.render_widget(Paragraph::new(line), cols[0]);
+            let frame = RAT_FRAMES[(self.tick / 3) % RAT_FRAMES.len()];
+            f.render_widget(
+                Paragraph::new(frame)
+                    .style(Style::default().fg(Color::Gray))
+                    .alignment(Alignment::Right),
+                cols[1],
+            );
+        } else {
+            f.render_widget(Paragraph::new(line), area);
+        }
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
@@ -1941,5 +1970,29 @@ mod tests {
         let first = disc_fingerprint(&source, &disc);
         disc.titles.push(title(2, 1, 60));
         assert_ne!(first, disc_fingerprint(&source, &disc));
+    }
+
+    #[test]
+    fn header_shows_an_animated_rat() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let header = |app: &App, terminal: &mut Terminal<TestBackend>| {
+            terminal.draw(|frame| app.ui(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>()
+        };
+
+        app.tick = 0;
+        let first = header(&app, &mut terminal);
+        assert!(first.contains("<:3 )~~~"), "expected the rat: {first:?}");
+
+        app.tick = 9; // tick / 3 == 3, the blink frame
+        let blinked = header(&app, &mut terminal);
+        assert!(blinked.contains("<;3"), "expected a blink: {blinked:?}");
     }
 }

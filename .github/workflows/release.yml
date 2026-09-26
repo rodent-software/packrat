@@ -39,7 +39,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdvdcss-dev
+          sudo apt-get install -y libdvd-pkg
+          # See ci.yml: run libdvd-pkg's builder directly so libdvdcss is
+          # present before the dvdcss build links against it.
+          sudo /usr/lib/libdvd-pkg/b-i_libdvdcss.sh
+          sudo ldconfig
           cargo build --release --target ${{ matrix.target }} --features dvdcss
       - name: Build (other)
         if: runner.os != 'Linux'

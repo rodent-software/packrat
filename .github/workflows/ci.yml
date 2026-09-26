@@ -26,7 +26,16 @@ jobs:
         run: cargo test --workspace --verbose
       - name: Install libdvdcss (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdvdcss-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdvd-pkg
+          # libdvd-pkg normally builds libdvdcss from an APT post-invoke hook,
+          # which is deferred while the dpkg database is locked ("postponed
+          # till after next APT operation"). Run its builder directly so the
+          # library exists before the dvdcss build links against it.
+          sudo /usr/lib/libdvd-pkg/b-i_libdvdcss.sh
+          sudo ldconfig
+          ldconfig -p | grep libdvdcss
       - name: Build with dvdcss (Linux)
         if: runner.os == 'Linux'
         run: cargo build --workspace --features dvdcss

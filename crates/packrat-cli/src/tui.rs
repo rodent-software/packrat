@@ -118,10 +118,12 @@ enum Stage {
     Done,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Show,
     Season,
+    /// First episode on the disc, for a TV disc the label placed wrongly.
+    Episode,
     Jobs,
 }
 
@@ -198,19 +200,25 @@ enum DetectField {
 }
 
 impl Field {
-    fn next(self) -> Self {
-        match self {
-            Self::Show => Self::Season,
-            Self::Season => Self::Jobs,
-            Self::Jobs => Self::Show,
+    /// The next field in tab order. A movie has no episode field, so it moves
+    /// straight from the year to the file list.
+    fn next(self, is_movie: bool) -> Self {
+        match (self, is_movie) {
+            (Self::Show, _) => Self::Season,
+            (Self::Season, true) => Self::Jobs,
+            (Self::Season, false) => Self::Episode,
+            (Self::Episode, _) => Self::Jobs,
+            (Self::Jobs, _) => Self::Show,
         }
     }
 
-    fn prev(self) -> Self {
-        match self {
-            Self::Show => Self::Jobs,
-            Self::Season => Self::Show,
-            Self::Jobs => Self::Season,
+    fn prev(self, is_movie: bool) -> Self {
+        match (self, is_movie) {
+            (Self::Show, _) => Self::Jobs,
+            (Self::Jobs, true) => Self::Season,
+            (Self::Jobs, false) => Self::Episode,
+            (Self::Episode, _) => Self::Season,
+            (Self::Season, _) => Self::Show,
         }
     }
 }
@@ -439,6 +447,8 @@ struct App {
     // Editable plan
     show_input: TextInput,
     season_input: TextInput,
+    /// Manual first episode number; empty means let the match decide.
+    first_episode_input: TextInput,
     tv_input: TextInput,
     movie_input: TextInput,
     tmdb_input: TextInput,
@@ -524,6 +534,7 @@ impl App {
             device: None,
             show_input: TextInput::default(),
             season_input: TextInput::default(),
+            first_episode_input: TextInput::default(),
             tv_input,
             movie_input,
             tmdb_input,
@@ -744,6 +755,7 @@ impl App {
         self.job_cursor = 0;
         self.show_input = TextInput::default();
         self.season_input = TextInput::default();
+        self.first_episode_input = TextInput::default();
         self.ejected = false;
         self.eject_then_picker = false;
         self.eject_note = None;
@@ -981,9 +993,10 @@ impl App {
     }
 
     fn on_key_plan(&mut self, key: KeyEvent) {
+        let is_movie = self.is_movie();
         match key.code {
-            KeyCode::Tab => self.focus = self.focus.next(),
-            KeyCode::BackTab => self.focus = self.focus.prev(),
+            KeyCode::Tab => self.focus = self.focus.next(is_movie),
+            KeyCode::BackTab => self.focus = self.focus.prev(is_movie),
             KeyCode::Esc => {
                 if self.focus == Field::Jobs {
                     self.should_quit = true;
@@ -992,13 +1005,14 @@ impl App {
                 }
             }
             _ => match self.focus {
-                Field::Show | Field::Season => {
+                Field::Show | Field::Season | Field::Episode => {
                     if key.code == KeyCode::Enter {
                         self.apply_edits();
                     } else {
                         let input = match self.focus {
                             Field::Show => &mut self.show_input,
-                            _ => &mut self.season_input,
+                            Field::Season => &mut self.season_input,
+                            _ => &mut self.first_episode_input,
                         };
                         edit_input(input, key);
                     }
@@ -1040,6 +1054,14 @@ impl App {
     }
 
     // -- Actions ----------------------------------------------------------
+
+    /// Whether the loaded disc is a movie, so it is named from TMDb and has no
+    /// season or episode fields.
+    fn is_movie(&self) -> bool {
+        self.classification
+            .as_ref()
+            .is_some_and(|c| c.kind == DiscKind::Movie)
+    }
 
     fn tv_path(&self) -> Option<PathBuf> {
         path_from(&self.tv_input)
@@ -1083,7 +1105,7 @@ impl App {
     }
 
     /// Recompute the metadata and job list after the user edits the show and
-    /// season, or the movie title and year.
+    /// season (or movie title and year), or corrects the first episode.
     fn apply_edits(&mut self) {
         self.meta_note = None;
         let Some(disc) = self.disc.clone() else {
@@ -1093,12 +1115,9 @@ impl App {
         let show = self.show_input.trimmed();
         let show = if show.is_empty() { None } else { Some(show) };
         let season = self.season_input.trimmed().parse::<u16>().ok();
+        let first_episode = self.first_episode_input.trimmed().parse::<u16>().ok();
 
-        let is_movie = self
-            .classification
-            .as_ref()
-            .map(|c| c.kind == DiscKind::Movie)
-            .unwrap_or(false);
+        let is_movie = self.is_movie();
         if is_movie {
             self.naming = None;
             self.meta_show = None;
@@ -1148,7 +1167,14 @@ impl App {
                 let tx = self.tx.clone();
                 let preferred = preferred_titles(&disc);
                 std::thread::spawn(move || {
-                    match resolve_naming(&tv_dir, &disc, &preferred, show.as_deref(), season) {
+                    match resolve_naming(
+                        &tv_dir,
+                        &disc,
+                        &preferred,
+                        show.as_deref(),
+                        season,
+                        first_episode,
+                    ) {
                         Ok(resolved) => {
                             let _ = tx.send(WorkerEvent::MetaReady {
                                 show: resolved.show,
@@ -1390,6 +1416,7 @@ impl App {
                     label.season.map(|s| s.to_string())
                 };
                 self.season_input = TextInput::from(&secondary.unwrap_or_default());
+                self.first_episode_input = TextInput::default();
                 self.source = Some(source);
                 self.disc = Some(disc);
                 self.classification = Some(classification);
@@ -1950,14 +1977,25 @@ impl App {
 
         self.render_disc_summary(f, rows[0]);
 
-        // For TV these are Show + Season; for movies, Title + Year.
-        let (first_title, first_hint, second_title) = if is_movie {
-            (" Title ", "TMDb searches this name", " Year ")
+        // A TV disc has Show, Season and First episode; a movie has Title and
+        // Year. The first-episode box is where a disc the label mis-placed is
+        // corrected.
+        let fields = if is_movie {
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(rows[1])
         } else {
-            (" Show ", "TVmaze searches this name", " Season ")
+            Layout::horizontal([
+                Constraint::Percentage(42),
+                Constraint::Percentage(28),
+                Constraint::Percentage(30),
+            ])
+            .split(rows[1])
         };
-        let fields = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(rows[1]);
+        let (first_title, first_hint) = if is_movie {
+            (" Title ", "TMDb searches this name")
+        } else {
+            (" Show ", "TVmaze searches this name")
+        };
         f.render_widget(
             self.field(
                 first_title,
@@ -1970,6 +2008,7 @@ impl App {
         if self.focus == Field::Show {
             set_cursor(f, fields[0], &self.show_input);
         }
+        let second_title = if is_movie { " Year " } else { " Season " };
         f.render_widget(
             self.field(
                 second_title,
@@ -1981,6 +2020,20 @@ impl App {
         );
         if self.focus == Field::Season {
             set_cursor(f, fields[1], &self.season_input);
+        }
+        if !is_movie {
+            f.render_widget(
+                self.field(
+                    " First episode ",
+                    &self.first_episode_input,
+                    self.focus == Field::Episode,
+                    "e.g. 29",
+                ),
+                fields[2],
+            );
+            if self.focus == Field::Episode {
+                set_cursor(f, fields[2], &self.first_episode_input);
+            }
         }
 
         let mut row = 2;
@@ -3905,5 +3958,48 @@ mod tests {
         assert!(screen.contains("Show"), "{screen}");
         assert!(!screen.contains("TV directory"), "{screen}");
         assert!(!screen.contains("Movie directory"), "{screen}");
+    }
+
+    #[test]
+    fn tv_plan_tabs_through_show_season_and_episode() {
+        assert_eq!(Field::Show.next(false), Field::Season);
+        assert_eq!(Field::Season.next(false), Field::Episode);
+        assert_eq!(Field::Episode.next(false), Field::Jobs);
+        assert_eq!(Field::Jobs.next(false), Field::Show);
+        assert_eq!(Field::Show.prev(false), Field::Jobs);
+        assert_eq!(Field::Jobs.prev(false), Field::Episode);
+        assert_eq!(Field::Episode.prev(false), Field::Season);
+    }
+
+    #[test]
+    fn movie_plan_skips_the_episode_field() {
+        assert_eq!(Field::Season.next(true), Field::Jobs);
+        assert_eq!(Field::Jobs.prev(true), Field::Season);
+    }
+
+    #[test]
+    fn first_episode_types_into_its_field() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.classification = Some(kind(DiscKind::TvSeries));
+        app.focus = Field::Episode;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
+
+        assert_eq!(app.first_episode_input.as_str(), "29");
+    }
+
+    #[test]
+    fn plan_screen_shows_the_first_episode_field_for_tv() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.classification = Some(kind(DiscKind::TvSeries));
+
+        let screen = screen(&mut app, 120, 20);
+
+        assert!(screen.contains("First episode"), "{screen}");
+        assert!(screen.contains("e.g. 29"), "{screen}");
     }
 }

@@ -24,8 +24,11 @@ can:
   from the disc label, so the whole pipeline still works offline.
 - pick which drive to read when more than one is attached (`Tab`, `↑`/`↓`,
   `Enter`), and switch drives from a plan with `d`
-- correct the **show** and **season** if TVmaze guessed wrong (packrat searches
-  TVmaze for the name)
+- correct the **show**, **season** and **first episode** if TVmaze guessed
+  wrong (packrat searches TVmaze for the name). Later discs of a season are
+  numbered after the episodes already in your library, so a final disc holding
+  fewer episodes than the earlier ones still lands on the right numbers; the
+  **first episode** box overrides that when the label is wrong
 - correct the **movie title and year** if TMDb guessed wrong; when several
   releases match, `[` and `]` cycle through the candidates
 - include or skip individual files, and add **extras** (trailers/featurettes).
@@ -49,9 +52,9 @@ A typical session:
 
 1. Run `packrat` with a disc inserted. On the first run, set your TV and movie
    directories on the settings screen and press `Enter` to save and continue.
-2. Check the disc packrat found and correct the show or season if it guessed
-   wrong (`Enter` re-runs the TVmaze lookup). For a movie, correct the title or
-   year; `Enter` re-runs the TMDb lookup.
+2. Check the disc packrat found and correct the show, season or first episode
+   if it guessed wrong (`Enter` re-runs the TVmaze lookup). For a movie, correct
+   the title or year; `Enter` re-runs the TMDb lookup.
 3. Check the proposed files, unchecking anything you do not want (`Space`).
 4. Press `r` to back up. Progress is shown per file, and `q` stops after the
    current file. With **Eject when done** enabled the tray opens once it

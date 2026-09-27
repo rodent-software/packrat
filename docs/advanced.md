@@ -43,6 +43,10 @@ packrat split /run/media/$USER/THE_MATRIX_1999 --out-dir out \
 # Override the title or year TMDb is searched with
 packrat split /run/media/$USER/DVD_LABEL --out-dir out \
   --movie-dir /mnt/media/Movies --movie "The Matrix" --year 1999
+
+# A disc the label places wrongly: number its episodes from 29 instead
+packrat split /run/media/$USER/DRAGON_BALL_S1_D5 --out-dir out \
+  --tv-dir /mnt/media/tv --first-episode 29 --dry-run
 ```
 
 `--dry-run` prints the plan without remuxing anything, which is the quickest

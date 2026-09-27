@@ -189,6 +189,45 @@ pub fn match_episodes(
         .collect()
 }
 
+/// Map `segments` onto a run of episodes that starts at the explicit episode
+/// number `first`.
+///
+/// This backs a user's manual correction of a disc whose place in the season
+/// the label got wrong (a final disc with fewer episodes than the earlier
+/// ones, say). Numbers increase by one per segment and do not need to exist in
+/// the provider's list: an episode the provider does not know is still named
+/// with the number the user asked for, just without a title or runtime.
+pub fn match_episodes_from(
+    episodes: &[Episode],
+    season: u16,
+    first: u16,
+    segments: &[Duration],
+) -> Vec<EpisodeMatch> {
+    let runtime_of = |episode: &Episode| {
+        episode
+            .runtime
+            .map(|m| Duration::from_secs(u64::from(m) * 60))
+    };
+
+    segments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _segment)| {
+            let number = first.checked_add(u16::try_from(i).ok()?)?;
+            let episode = episodes
+                .iter()
+                .find(|e| e.season == u32::from(season) && e.number == Some(u32::from(number)));
+            Some(EpisodeMatch {
+                season,
+                number,
+                title: episode.and_then(|e| e.name.clone()),
+                runtime: episode.and_then(runtime_of),
+                segment: i,
+            })
+        })
+        .collect()
+}
+
 /// A single file that spans several consecutive episodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeSpan {
@@ -275,6 +314,40 @@ pub fn match_span(
     let last = u16::try_from(season_episodes[end - 1].number.unwrap_or(end as u32)).ok()?;
     let title = (end == start + 1)
         .then(|| season_episodes[start].name.clone())
+        .flatten();
+
+    Some(EpisodeSpan {
+        season,
+        first,
+        last,
+        title,
+    })
+}
+
+/// Anchor a multi-episode file at the explicit episode number `first`.
+///
+/// The provider's runtimes still decide how many episodes the file spans; the
+/// user's correction only says where that run begins. Without runtimes the
+/// file is treated as a single episode, so it is at least named as the episode
+/// the user identified instead of falling back to a generic file name.
+pub fn match_span_from(
+    episodes: &[Episode],
+    season: u16,
+    first: u16,
+    segment: Duration,
+) -> Option<EpisodeSpan> {
+    let span = match_span(episodes, season, segment, None);
+    let count = span
+        .map(|s| s.last.saturating_sub(s.first).saturating_add(1))
+        .unwrap_or(1);
+    let last = first.checked_add(count.saturating_sub(1))?;
+    let title = (count == 1)
+        .then(|| {
+            episodes
+                .iter()
+                .find(|e| e.season == u32::from(season) && e.number == Some(u32::from(first)))
+                .and_then(|e| e.name.clone())
+        })
         .flatten();
 
     Some(EpisodeSpan {
@@ -484,5 +557,50 @@ mod tests {
             })
             .collect();
         assert!(match_span(&episodes, 1, Duration::from_secs(48 * 60), None).is_none());
+    }
+
+    #[test]
+    fn explicit_start_overrides_the_provider_window() {
+        // A last disc the label places at episodes 29-31 even though the
+        // provider's season stops at 28.
+        let episodes: Vec<Episode> = (1..=6).map(|n| episode(n, 24)).collect();
+        let segments: Vec<Duration> = (0..3).map(|_| Duration::from_secs(24 * 60)).collect();
+
+        let matched = match_episodes_from(&episodes, 1, 29, &segments);
+        let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![29, 30, 31]);
+        // The provider has no episodes at those numbers, so there are no titles.
+        assert!(matched.iter().all(|m| m.title.is_none()));
+    }
+
+    #[test]
+    fn explicit_start_keeps_provider_titles_when_they_line_up() {
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        let segments = [Duration::from_secs(24 * 60), Duration::from_secs(24 * 60)];
+
+        let matched = match_episodes_from(&episodes, 1, 7, &segments);
+        assert_eq!(matched[0].number, 7);
+        assert_eq!(matched[0].title.as_deref(), Some("Episode 7"));
+        assert_eq!(matched[1].number, 8);
+    }
+
+    #[test]
+    fn explicit_span_anchors_at_the_requested_episode() {
+        let episodes: Vec<Episode> = (1..=6).map(|n| episode(n, 24)).collect();
+        let span = match_span_from(&episodes, 1, 29, Duration::from_secs(48 * 60)).expect("span");
+        assert_eq!((span.first, span.last), (29, 30));
+        assert_eq!(span.title, None);
+    }
+
+    #[test]
+    fn explicit_span_defaults_to_one_episode_without_runtimes() {
+        let episodes: Vec<Episode> = (1..=6)
+            .map(|n| Episode {
+                runtime: None,
+                ..episode(n, 0)
+            })
+            .collect();
+        let span = match_span_from(&episodes, 1, 4, Duration::from_secs(48 * 60)).expect("span");
+        assert_eq!((span.first, span.last), (4, 4));
     }
 }

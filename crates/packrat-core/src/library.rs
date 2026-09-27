@@ -97,6 +97,69 @@ pub fn season_dir_in(tv_dir: &Path, show: &str, year: Option<u16>, season: u16) 
     show_dir_in(tv_dir, show, year).join(format!("Season {season:02}"))
 }
 
+/// The episode number in a Plex-style file name for `season`, e.g. `28` from
+/// `Dragon Ball (1986) - s01e28 - The Final Blow.mkv`.
+///
+/// Multi-episode names (`s01e02-e03`) yield the last episode in the span, so a
+/// library's highest episode is the end of what has been backed up. Returns
+/// `None` for a name that is not an episode of `season`.
+pub fn episode_number_from_file_name(file_name: &str, season: u16) -> Option<u16> {
+    let lower = file_name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + 4 < bytes.len() {
+        if bytes[i] == b's'
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3] == b'e'
+            && lower[i + 1..i + 3].parse::<u16>() == Ok(season)
+        {
+            let mut best = None;
+            let mut j = i + 4;
+            loop {
+                let start = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == start {
+                    break;
+                }
+                if let Ok(number) = lower[start..j].parse::<u16>() {
+                    best = Some(best.map_or(number, |b: u16| b.max(number)));
+                }
+                // Step over the `-e` of a multi-episode name, then keep going.
+                if bytes.get(j) == Some(&b'-') && bytes.get(j + 1) == Some(&b'e') {
+                    j += 2;
+                } else {
+                    break;
+                }
+            }
+            if best.is_some() {
+                return best;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Highest episode already present in `dir` for `season`, when it holds any
+/// named episodes. Used to place a later disc after the episodes backed up
+/// from the earlier ones, which the label alone cannot tell us.
+pub fn highest_episode(dir: &Path, season: u16) -> Option<u16> {
+    let mut highest = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(number) = episode_number_from_file_name(name, season) {
+            highest = Some(highest.map_or(number, |b: u16| b.max(number)));
+        }
+    }
+    highest
+}
+
 /// Extra (featurette/trailer/etc.) belonging to a show:
 /// `<tv_dir>/<Show (Year)>/Other/<Description>.mkv`.
 ///
@@ -346,5 +409,40 @@ mod tests {
             extra,
             Path::new("/mnt/dvd/media/tv/Firefly/Other/Deleted Scenes.mkv")
         );
+    }
+
+    #[test]
+    fn parses_episode_numbers_from_plex_file_names() {
+        assert_eq!(
+            episode_number_from_file_name("Dragon Ball (1986) - s01e28 - The Final Blow.mkv", 1),
+            Some(28)
+        );
+        assert_eq!(
+            episode_number_from_file_name("Show - s02e03.mkv", 1),
+            None,
+            "another season's episode is ignored"
+        );
+        assert_eq!(
+            episode_number_from_file_name("Show - s01e02-e03.mkv", 1),
+            Some(3),
+            "a multi-episode name yields the last episode"
+        );
+        assert_eq!(episode_number_from_file_name("not an episode.mkv", 1), None);
+    }
+
+    #[test]
+    fn highest_episode_reads_the_season_folder() {
+        let dir = std::env::temp_dir().join(format!("packrat-library-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Show - s01e07 - Seven.mkv"), b"x").unwrap();
+        std::fs::write(dir.join("Show - s01e03 - Three.mkv"), b"x").unwrap();
+        std::fs::write(dir.join("Show - s01e02-e03 - Double.mkv"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+        assert_eq!(highest_episode(&dir, 1), Some(7));
+        assert_eq!(highest_episode(&dir, 2), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

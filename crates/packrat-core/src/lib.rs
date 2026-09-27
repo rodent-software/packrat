@@ -34,7 +34,8 @@ pub use library::{
     movie_part_file_in, sanitize_component, season_dir, season_dir_in, show_dir, show_dir_in,
 };
 pub use meta::{
-    match_episodes, match_span, search_show, Episode, EpisodeMatch, EpisodeSpan, MetaError, Show,
+    match_episodes, match_episodes_from, match_span, match_span_from, search_show, Episode,
+    EpisodeMatch, EpisodeSpan, MetaError, Show,
 };
 pub use movie::{
     rank as rank_movies, resolve as resolve_movie, MovieQuery, MovieResolution, AUTO_ACCEPT,

@@ -172,17 +172,44 @@ fn remux_chain_impl(
             )
         }
         DiscSource::Device { device, .. } => {
-            let mut reader = crate::device::DeviceChainReader::open(device, title.vts)?;
-            remux_chapters_with_reader_progress_cancel(
-                &mut reader,
-                vts,
-                title,
-                first,
-                last,
-                out,
-                progress,
-                cancel,
-            )
+            // The raw device is only needed to decrypt CSS discs. Its
+            // filesystem can still be unreadable — copy-protection schemes and
+            // damage corrupt the ISO 9660 / UDF directory records a ripper uses
+            // to find the VOBs — while the mounted folder reads perfectly well.
+            // Fall back to the mount rather than failing the rip outright; an
+            // encrypted disc still fails here, because its VOB sectors cannot
+            // be read through the mount either.
+            match crate::device::DeviceChainReader::open(device, title.vts) {
+                Ok(mut reader) => remux_chapters_with_reader_progress_cancel(
+                    &mut reader,
+                    vts,
+                    title,
+                    first,
+                    last,
+                    out,
+                    progress,
+                    cancel,
+                ),
+                Err(device_error) => {
+                    let mut reader = match VtsChainReader::open(source.video_ts(), title.vts) {
+                        Ok(reader) => reader,
+                        // Neither medium can supply the chain: report the
+                        // device failure, since that names the filesystem that
+                        // could not be read.
+                        Err(_) => return Err(device_error),
+                    };
+                    remux_chapters_with_reader_progress_cancel(
+                        &mut reader,
+                        vts,
+                        title,
+                        first,
+                        last,
+                        out,
+                        progress,
+                        cancel,
+                    )
+                }
+            }
         }
     }
 }

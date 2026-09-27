@@ -1056,13 +1056,8 @@ impl App {
             }
             let cols =
                 Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
-            // Centre the badge against the three-row mouse.
-            let text_area = Rect {
-                y: area.y + (area.height - 1) / 2,
-                height: 1,
-                ..cols[0]
-            };
-            f.render_widget(Paragraph::new(badge), text_area);
+            // Top-align the title with the first row of the three-row mouse.
+            f.render_widget(Paragraph::new(badge), cols[0]);
             f.render_widget(
                 Paragraph::new(rat_lines(frame)).alignment(Alignment::Right),
                 cols[1],
@@ -2307,6 +2302,24 @@ mod tests {
         assert_eq!(*app.rat_frame(), RAT_ERROR);
         assert!(app.rat_frame()[0].contains('ｘ'));
         assert!(app.rat_frame()[0].contains('プ'));
+    }
+
+    #[test]
+    fn header_title_is_top_aligned() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+
+        // The title sits on the very first row, not centred against the mouse.
+        assert!(row.contains("packrat"), "row 0: {row:?}");
     }
 
     #[test]

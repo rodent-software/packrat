@@ -33,3 +33,6 @@ Preview a release without building it:
 ```sh
 dist plan
 ```
+
+Package-manager channels (apt/rpm, AUR, Winget, Scoop) are described in
+[Distributing](distribution.md).

@@ -1,0 +1,41 @@
+# nfpm config for the Linux .deb and .rpm packages.
+#
+# The packaging job stages the target binary at target/nfpm/packrat, then runs:
+#   VERSION=<semver> ARCH=<amd64|arm64> \
+#     nfpm package -f packaging/nfpm.yaml -p deb \
+#     -t packrat_<version>_<arch>.deb
+#
+# The binary is built without libdvdcss, so the packages only *recommend* the
+# library rather than requiring it: packrat works on unencrypted discs without
+# it, and the user's distribution supplies it where it can.
+name: packrat
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: "1"
+section: utils
+priority: optional
+maintainer: packrat contributors
+vendor: rodent-software
+homepage: https://github.com/rodent-software/packrat
+license: GPL-3.0-or-later
+description: |
+  A free and open source physical media backup utility.
+
+  Back up DVDs into a Plex-compatible library. CSS-encrypted discs are read
+  through a libdvdcss that the user supplies; it is never bundled.
+contents:
+  - src: target/nfpm/packrat
+    dst: /usr/bin/packrat
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/doc/packrat/LICENSE
+overrides:
+  deb:
+    recommends:
+      - libdvd-pkg
+  rpm:
+    recommends:
+      - libdvdcss

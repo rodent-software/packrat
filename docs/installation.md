@@ -26,11 +26,29 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/rodent-software/pa
 | --- | --- |
 | macOS (Homebrew) | `brew install rodent-software/tap/packrat` |
 | Arch (AUR) | `yay -S packrat-bin` |
-| Debian / Ubuntu (apt) | `sudo apt update && sudo apt install packrat` |
-| Fedora / RHEL (COPR) | `sudo dnf copr enable rodent-software/packrat && sudo dnf install packrat` |
+| Debian / Ubuntu (apt) | `sudo apt install packrat` — [add the repository first](#linux-repositories) |
+| Fedora / RHEL (dnf) | `sudo dnf install packrat` — [add the repository first](#linux-repositories) |
 | Nix | `nix profile install github:rodent-software/packrat` |
 | Windows (Winget) | `winget install RodentSoftware.Packrat` |
 | Windows (Scoop) | `scoop bucket add rodent-software https://github.com/rodent-software/scoop-bucket && scoop install packrat` |
+
+### Linux repositories
+
+The apt and dnf packages are served from the project's own repository. Add it
+once, then install with the commands above:
+
+```sh
+# Debian and Ubuntu
+curl -fsSL https://rodent-software.github.io/packrat-repo/packrat.gpg \
+  | sudo tee /etc/apt/keyrings/packrat.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/packrat.gpg] https://rodent-software.github.io/packrat-repo/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/packrat.list
+sudo apt update
+
+# Fedora and RHEL
+sudo curl -fsSL https://rodent-software.github.io/packrat-repo/packrat.repo \
+  -o /etc/yum.repos.d/packrat.repo
+```
 
 Package-manager builds declare `libdvdcss` as a dependency wherever the
 platform's own repositories carry it, so on those channels CSS decryption works

@@ -1,0 +1,28 @@
+# Maintainer: packrat contributors <noreply@github.com>
+pkgname=packrat-bin
+_tag=0.1.0-rc.2
+pkgver=${_tag//-/_}
+pkgrel=1
+pkgdesc='Back up DVDs into a Plex-compatible library'
+arch=('x86_64' 'aarch64')
+url='https://github.com/rodent-software/packrat'
+license=('GPL-3.0-or-later')
+# libdvdcss is only needed to read CSS-encrypted discs; packrat loads it at
+# runtime and works on unencrypted discs without it.
+depends=('libdvdcss')
+provides=('packrat')
+conflicts=('packrat')
+options=('!strip')
+
+source_x86_64=("packrat-${_tag}.tar.xz::https://github.com/rodent-software/packrat/releases/download/v${_tag}/packrat-x86_64-unknown-linux-gnu.tar.xz")
+source_aarch64=("packrat-${_tag}.tar.xz::https://github.com/rodent-software/packrat/releases/download/v${_tag}/packrat-aarch64-unknown-linux-gnu.tar.xz")
+
+sha256sums_x86_64=('bf4f1ae3e49898663ee4ad6eab8177e487c477a9061af335867f7ed44037e472')
+sha256sums_aarch64=('8fe3a6b6dece767b78baa06a1206dd76c91ec5e094d6c0466d652ee53dcdaf7b')
+
+package() {
+  install -Dm755 "${srcdir}/packrat-${CARCH}-unknown-linux-gnu/packrat" \
+    "${pkgdir}/usr/bin/packrat"
+  install -Dm644 "${srcdir}/packrat-${CARCH}-unknown-linux-gnu/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

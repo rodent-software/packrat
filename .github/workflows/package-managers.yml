@@ -1,0 +1,201 @@
+# Publish a completed Release to the package-manager channels that cargo-dist
+# does not handle itself.
+#
+# cargo-dist owns `.github/workflows/release.yml`; this workflow reacts to it
+# with `workflow_run` rather than `release: published`, because releases created
+# with the default GITHUB_TOKEN do not trigger further workflows.
+#
+# Publishing to Winget, the AUR and the self-hosted apt/rpm repositories is
+# skipped until the matching secret is configured. See docs/distribution.md.
+name: Package managers
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  # Build .deb and .rpm packages for every release, prerelease included, and
+  # attach them to the GitHub release.
+  linux-packages:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the release
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.workflow_run.head_branch }}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "not a version tag: $tag"; exit 1 ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "prerelease=$(gh release view "$tag" --json isPrerelease -q .isPrerelease)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the Linux archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.meta.outputs.tag }}" \
+            --pattern 'packrat-*-unknown-linux-gnu.tar.xz' --dir dist
+          ls -la dist
+
+      - name: Build .deb and .rpm
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          NFPM_VERSION=2.47.0
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) triple=x86_64 ;;
+              arm64) triple=aarch64 ;;
+            esac
+            mkdir -p target/nfpm
+            tar -xJf "dist/packrat-${triple}-unknown-linux-gnu.tar.xz"
+            install -Dm755 "packrat-${triple}-unknown-linux-gnu/packrat" target/nfpm/packrat
+
+            ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p deb \
+              -t "dist/packrat_${VERSION}_${arch}.deb"
+            ARCH="$arch" nfpm package -f packaging/nfpm.yaml -p rpm \
+              -t "dist/packrat-${VERSION}-1.${triple}.rpm"
+          done
+
+          ls -la dist
+
+      - name: Attach packages to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.meta.outputs.tag }}" dist/*.deb dist/*.rpm --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+
+  # Refresh the self-hosted apt and rpm repositories in rodent-software/packrat-repo.
+  publish-linux-repo:
+    needs: linux-packages
+    if: ${{ needs.linux-packages.outputs.prerelease != 'true' }}
+    runs-on: ubuntu-22.04
+    env:
+      PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+      GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: pkgs
+
+      - name: Explain the skip
+        if: ${{ env.PACKAGES_TOKEN == '' || env.GPG_PRIVATE_KEY == '' }}
+        run: echo "PACKAGES_TOKEN or APT_GPG_PRIVATE_KEY is unset; not publishing the apt/rpm repositories."
+
+      - name: Publish
+        if: ${{ env.PACKAGES_TOKEN != '' && env.GPG_PRIVATE_KEY != '' }}
+        env:
+          VERSION: ${{ needs.linux-packages.outputs.version }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y reprepro createrepo-c gnupg
+
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          test -n "$GPG_KEY_ID"
+          export GPG_KEY_ID
+
+          git clone "https://x-access-token:${PACKAGES_TOKEN}@github.com/rodent-software/packrat-repo.git" repo
+          bash packaging/repo/publish-apt.sh "$PWD/repo" "$PWD/pkgs"
+          bash packaging/repo/publish-rpm.sh "$PWD/repo" "$PWD/pkgs"
+
+          cd repo
+          git config user.name "packrat release"
+          git config user.email "noreply@github.com"
+          git add -A
+          git commit -m "packrat ${VERSION}" || echo "nothing to commit"
+          git push
+
+  # Update the packrat-bin package on the AUR.
+  aur:
+    needs: linux-packages
+    if: ${{ needs.linux-packages.outputs.prerelease != 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Explain the skip
+        if: ${{ env.AUR_SSH_PRIVATE_KEY == '' }}
+        run: echo "AUR_SSH_PRIVATE_KEY is unset; not publishing to the AUR."
+
+      - name: Update the PKGBUILD
+        if: ${{ env.AUR_SSH_PRIVATE_KEY != '' }}
+        env:
+          VERSION: ${{ needs.linux-packages.outputs.version }}
+          TAG: ${{ needs.linux-packages.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/rodent-software/packrat/releases/download/${TAG}"
+          sha_x86=$(curl -fsSL "${base}/packrat-x86_64-unknown-linux-gnu.tar.xz.sha256" | awk '{print $1}')
+          sha_arm=$(curl -fsSL "${base}/packrat-aarch64-unknown-linux-gnu.tar.xz.sha256" | awk '{print $1}')
+          bash packaging/aur/update-pkgbuild.sh "$VERSION" "$sha_x86" "$sha_arm"
+
+      - name: Publish to the AUR
+        if: ${{ env.AUR_SSH_PRIVATE_KEY != '' }}
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: packrat-bin
+          pkgbuild: packaging/aur/PKGBUILD
+          commit_username: packrat
+          commit_email: noreply@github.com
+          ssh_private_key: ${{ env.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ needs.linux-packages.outputs.version }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+
+  # Open a PR against microsoft/winget-pkgs. A version of the package must
+  # already exist there; see docs/distribution.md for the one-time submission.
+  winget:
+    needs: linux-packages
+    if: ${{ needs.linux-packages.outputs.prerelease != 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Explain the skip
+        if: ${{ env.WINGET_TOKEN == '' }}
+        run: echo "WINGET_TOKEN is unset; not publishing to Winget."
+
+      - name: Publish to Winget
+        if: ${{ env.WINGET_TOKEN != '' }}
+        uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: RodentSoftware.Packrat
+          release-tag: ${{ needs.linux-packages.outputs.tag }}
+          installers-regex: '\.msi$'
+          token: ${{ env.WINGET_TOKEN }}

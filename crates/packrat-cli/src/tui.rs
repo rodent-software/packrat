@@ -1454,15 +1454,16 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let metrics = self.metrics();
-        let (marker, action, color) = match progress.phase {
+        let (marker, color) = match progress.phase {
             RemuxPhase::Probing => (
                 SPINNER[(self.tick / 2) % SPINNER.len()].to_string(),
-                "analyzing",
                 Color::Yellow,
             ),
-            RemuxPhase::Muxing => ("▶".to_string(), "writing", Color::Green),
+            RemuxPhase::Muxing => ("▶".to_string(), Color::Green),
         };
-        // Read and write rates side by side, so a slow side is obvious.
+        // The probe pass writes nothing, so it carries just the read rate and
+        // an "analyzing" label; once muxing starts both rates are shown side
+        // by side, which makes a slow side obvious without a second verb.
         let rate = |value: Option<f64>| {
             value
                 .map(|mib| format!("{mib:.1}"))
@@ -1474,17 +1475,36 @@ impl App {
             .file_eta
             .map(|d| format!("ETA {}", fmt_eta(d)))
             .unwrap_or_else(|| "ETA —".into());
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!(" {marker} "), Style::default().fg(color)),
             Span::styled(name, Style::default().fg(Color::Cyan)),
-            Span::styled(format!("  {action}"), Style::default().fg(color)),
-            Span::styled("  read ", Style::default().fg(Color::DarkGray)),
-            Span::styled(read, Style::default().fg(Color::Green)),
-            Span::styled(" · write ", Style::default().fg(Color::DarkGray)),
-            Span::styled(write, Style::default().fg(Color::Cyan)),
-            Span::styled(" MB/s", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("  {eta}"), Style::default().fg(Color::DarkGray)),
-        ])
+        ];
+        if progress.phase == RemuxPhase::Probing {
+            spans.push(Span::styled("  analyzing", Style::default().fg(color)));
+            spans.push(Span::styled(
+                "  read ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(read, Style::default().fg(Color::Green)));
+            spans.push(Span::styled(" MB/s", Style::default().fg(Color::DarkGray)));
+        } else {
+            spans.push(Span::styled(
+                "  read ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(read, Style::default().fg(Color::Green)));
+            spans.push(Span::styled(
+                " · write ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(write, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(" MB/s", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(
+            format!("  {eta}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        Line::from(spans)
     }
 
     fn render_done(&self, f: &mut Frame, area: Rect) {
@@ -2190,6 +2210,45 @@ mod tests {
         assert!(row.contains("2.0"), "row: {row:?}");
         assert!(row.contains("write"), "row: {row:?}");
         assert!(row.contains("0.5"), "row: {row:?}");
+        assert!(
+            !row.contains("writing"),
+            "the write stat needs no extra verb: {row:?}"
+        );
+    }
+
+    #[test]
+    fn ripping_screen_labels_the_probe_pass_without_a_write_rate() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        app.stage = Stage::Ripping;
+        app.total = 1;
+        app.jobs = vec![Job::new(&title(1, 1, 60), 1, 1, PathBuf::from("ep.mkv"))];
+        app.current = Some(ProgressSnapshot {
+            index: 0,
+            phase: RemuxPhase::Probing,
+            bytes_done: 30 * 1024 * 1024,
+            bytes_total: 120 * 1024 * 1024,
+            written_bytes: 0,
+            elapsed: Duration::from_secs(10),
+            read_rate: Some(3.0 * 1_048_576.0),
+            write_rate: Some(0.0),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 6)].symbol())
+            .collect();
+
+        assert!(row.contains("analyzing"), "row: {row:?}");
+        assert!(row.contains("3.0"), "row: {row:?}");
+        assert!(
+            !row.contains("write"),
+            "no write rate while probing: {row:?}"
+        );
     }
 
     #[test]

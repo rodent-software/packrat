@@ -39,16 +39,18 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// others blink, flick an ear, sniff, or carry a load. The tail stays put —
 /// swapping multi-cell glyphs cannot interpolate smoothly. Each frame is three
 /// lines; the renderer pads them to a common width so the ambiguous-width
-/// glyphs cannot shift the art.
-const RAT_IDLE: [&str; 3] = ["　C・プ", "＼(　）", "　　｀｀"];
-const RAT_BLINK: [&str; 3] = ["　C－プ", "＼(　）", "　　｀｀"];
-const RAT_EAR: [&str; 3] = ["　^・プ", "＼(　）", "　　｀｀"];
-const RAT_SNIFF: [&str; 3] = ["　C・プ｡", "＼(　）", "　　｀｀"];
-const RAT_PACK: [&str; 3] = ["　C・プ", "＼(▣ ）", "　　｀｀"];
-const RAT_PACK_BLINK: [&str; 3] = ["　C－プ", "＼(▣ ）", "　　｀｀"];
-const RAT_CHEESE: [&str; 3] = ["　C・プ■■", "＼(　）", "　　｀｀"];
-const RAT_CHEESE_BLINK: [&str; 3] = ["　C－プ■■", "＼(　）", "　　｀｀"];
-const RAT_ERROR: [&str; 3] = ["　Cｘプ", "＼(　）", "　　｀｀"];
+/// glyphs cannot shift the art. The feet sit under the middle of the body, and
+/// the trailing space on that row keeps every pose the same width so the mouse
+/// does not jog sideways as it animates.
+const RAT_IDLE: [&str; 3] = ["　C・プ", "＼(　）", "　｀｀　"];
+const RAT_BLINK: [&str; 3] = ["　C－プ", "＼(　）", "　｀｀　"];
+const RAT_EAR: [&str; 3] = ["　^・プ", "＼(　）", "　｀｀　"];
+const RAT_SNIFF: [&str; 3] = ["　C・プ｡", "＼(　）", "　｀｀　"];
+const RAT_PACK: [&str; 3] = ["　C・プ", "＼(▣ ）", "　｀｀　"];
+const RAT_PACK_BLINK: [&str; 3] = ["　C－プ", "＼(▣ ）", "　｀｀　"];
+const RAT_CHEESE: [&str; 3] = ["　C・プ■■", "＼(　）", "　｀｀　"];
+const RAT_CHEESE_BLINK: [&str; 3] = ["　C－プ■■", "＼(　）", "　｀｀　"];
+const RAT_ERROR: [&str; 3] = ["　Cｘプ", "＼(　）", "　｀｀　"];
 
 /// Plain-ASCII fallback for terminals without the wide glyphs.
 const RAT_ASCII: [[&str; 3]; 3] = [
@@ -2947,5 +2949,66 @@ mod tests {
             screen.contains("▶"),
             "the cursor highlights a row: {screen}"
         );
+    }
+
+    #[test]
+    fn rat_feet_are_centred_under_the_body() {
+        /// Display width of the part of `row` before its first `glyph`.
+        fn width_before(row: &str, glyph: char) -> usize {
+            let byte = row.find(glyph).expect("glyph is in the frame");
+            Line::from(row[..byte].to_string()).width()
+        }
+
+        for frame in [
+            &RAT_IDLE,
+            &RAT_BLINK,
+            &RAT_EAR,
+            &RAT_SNIFF,
+            &RAT_PACK,
+            &RAT_PACK_BLINK,
+            &RAT_CHEESE,
+            &RAT_CHEESE_BLINK,
+            &RAT_ERROR,
+        ] {
+            let (body, feet) = (frame[1], frame[2]);
+            // The torso runs from its opening `(` through the closing `）`; its
+            // width is odd, so the even-width feet can only centre to within
+            // half a cell.
+            let body_start = width_before(body, '(');
+            let body_end = width_before(body, '）') + Line::from("）".to_string()).width();
+            let feet_start = width_before(feet, '｀');
+            let feet_end = feet_start + Line::from("｀｀".to_string()).width();
+
+            let body_centre = (body_start + body_end) as f32 / 2.0;
+            let feet_centre = (feet_start + feet_end) as f32 / 2.0;
+            assert!(
+                (body_centre - feet_centre).abs() <= 1.0,
+                "the feet at {feet_start}..{feet_end} should sit under the body at \
+                 {body_start}..{body_end}: {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rat_poses_share_a_width_within_each_stage() {
+        // Every pose a stage can cycle through must render at the same width,
+        // or the whole mouse would jump sideways as it animates.
+        let frame_width = |frame: &[&str; 3]| {
+            frame
+                .iter()
+                .map(|row| Line::from(*row).width())
+                .max()
+                .unwrap_or(0)
+        };
+
+        // Detect cycles the sniff and idle poses; errors can interrupt either.
+        assert_eq!(frame_width(&RAT_SNIFF), frame_width(&RAT_IDLE));
+        assert_eq!(frame_width(&RAT_IDLE), frame_width(&RAT_ERROR));
+        // Plan blinks and flicks an ear.
+        assert_eq!(frame_width(&RAT_BLINK), frame_width(&RAT_IDLE));
+        assert_eq!(frame_width(&RAT_EAR), frame_width(&RAT_IDLE));
+        // Ripping hauls the pack; Done holds the cheese.
+        assert_eq!(frame_width(&RAT_PACK_BLINK), frame_width(&RAT_PACK));
+        assert_eq!(frame_width(&RAT_CHEESE_BLINK), frame_width(&RAT_CHEESE));
     }
 }

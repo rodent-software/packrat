@@ -107,7 +107,7 @@ pub fn run() -> Result<()> {
 // State
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Detect,
     Plan,
@@ -122,6 +122,15 @@ enum Field {
     TvDir,
     MovieDir,
     Jobs,
+}
+
+/// Which control the Detect screen is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectField {
+    /// The manual path text box.
+    Path,
+    /// The list of attached optical drives.
+    Drives,
 }
 
 impl Field {
@@ -269,7 +278,7 @@ enum WorkerEvent {
         device: Option<PathBuf>,
     },
     DiscError(String),
-    NoDisc(Vec<OpticalDrive>),
+    Drives(Vec<OpticalDrive>),
     MetaReady {
         show: Option<Show>,
         naming: Option<Naming>,
@@ -330,6 +339,11 @@ struct App {
     /// A detection thread is in flight; guards against overlapping scans.
     scan_in_flight: bool,
     drives: Vec<OpticalDrive>,
+    /// Selected row in `drives`.
+    drive_cursor: usize,
+    detect_focus: DetectField,
+    /// Drive last used, restored on the next launch and saved to config.
+    last_device: Option<PathBuf>,
     path_input: TextInput,
     detect_note: Option<String>,
     /// Fingerprint of the disc currently loaded, so a background re-scan of
@@ -397,6 +411,9 @@ impl App {
             detect_loading: false,
             scan_in_flight: false,
             drives: Vec::new(),
+            drive_cursor: 0,
+            detect_focus: DetectField::Drives,
+            last_device: config.last_device.clone(),
             path_input: TextInput::default(),
             detect_note: None,
             loaded: None,
@@ -431,10 +448,71 @@ impl App {
     /// Start a drive probe on a worker thread. `show_spinner` draws the
     /// scanning state for the initial probe and manual path loads; background
     /// re-scans leave the current screen visible.
+    ///
+    /// The last-used drive is auto-loaded when it is present, so a two-drive
+    /// setup does not force a choice every run; otherwise a single ready disc
+    /// loads straight away and several ready discs leave the picker up.
     fn begin_detection(&mut self, show_spinner: bool) {
         self.detect_loading = show_spinner;
         self.scan_in_flight = true;
-        detect_and_load(self.tx.clone());
+        detect_and_load(self.tx.clone(), self.last_device.clone());
+    }
+
+    /// Refresh the drive list without loading anything, used by the picker and
+    /// the "change drive" action.
+    fn refresh_drives(&mut self) {
+        self.scan_in_flight = true;
+        self.detect_loading = false;
+        list_drives(self.tx.clone());
+    }
+
+    /// Load the disc in the highlighted drive.
+    fn load_selected_drive(&mut self) {
+        let Some(drive) = self.drives.get(self.drive_cursor).cloned() else {
+            self.detect_note = Some("No drive selected".into());
+            return;
+        };
+        let Some(mount) = drive.mount.clone() else {
+            self.detect_note = Some(format!("{} has no mounted disc", drive.device.display()));
+            return;
+        };
+        self.detect_note = None;
+        self.detect_loading = true;
+        self.scan_in_flight = true;
+        load_drive(self.tx.clone(), drive.device, mount);
+    }
+
+    /// Return to the drive picker from the plan, without discarding it.
+    fn change_drive(&mut self) {
+        self.stage = Stage::Detect;
+        self.detect_focus = DetectField::Drives;
+        self.detect_note = None;
+        self.refresh_drives();
+    }
+
+    /// Replace the drive list, keeping the cursor on the drive that was
+    /// highlighted, then the last-used one, then the first ready disc.
+    fn set_drives(&mut self, drives: Vec<OpticalDrive>) {
+        let highlighted = self
+            .drives
+            .get(self.drive_cursor)
+            .map(|drive| drive.device.clone());
+        self.drive_cursor = highlighted
+            .as_ref()
+            .and_then(|device| drives.iter().position(|drive| &drive.device == device))
+            .or_else(|| {
+                self.last_device
+                    .as_ref()
+                    .and_then(|device| drives.iter().position(|drive| &drive.device == device))
+            })
+            .or_else(|| {
+                drives
+                    .iter()
+                    .position(|drive| drive.has_disc && drive.mount.is_some())
+            })
+            .unwrap_or(0)
+            .min(drives.len().saturating_sub(1));
+        self.drives = drives;
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -498,7 +576,13 @@ impl App {
         if self.tick % 20 != 0 {
             return;
         }
-        self.begin_detection(false);
+        // Once the picker has drives up, only refresh the list: auto-loading on
+        // a poll would yank the user away from a choice they are making.
+        if self.stage == Stage::Detect && !self.drives.is_empty() {
+            self.refresh_drives();
+        } else {
+            self.begin_detection(false);
+        }
     }
 
     // -- Input ------------------------------------------------------------
@@ -551,10 +635,39 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Enter => self.load_manual_path(),
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.detect_focus = match self.detect_focus {
+                    DetectField::Path => DetectField::Drives,
+                    DetectField::Drives => DetectField::Path,
+                };
+            }
+            KeyCode::Up => self.drive_cursor = self.drive_cursor.saturating_sub(1),
+            KeyCode::Down => {
+                if self.drive_cursor + 1 < self.drives.len() {
+                    self.drive_cursor += 1;
+                }
+            }
+            KeyCode::Enter => match self.detect_focus {
+                DetectField::Path => self.load_manual_path(),
+                DetectField::Drives => self.load_selected_drive(),
+            },
+            // Rescan the picker; while typing a path, `r` is just a character.
+            KeyCode::Char('r') if self.detect_focus == DetectField::Drives => {
+                self.refresh_drives();
+            }
+            KeyCode::Esc => {
+                // Arriving here from a plan, Esc backs out instead of quitting.
+                if self.disc.is_some() {
+                    self.stage = Stage::Plan;
+                    self.detect_note = None;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             _ => {
-                edit_input(&mut self.path_input, key);
+                if self.detect_focus == DetectField::Path {
+                    edit_input(&mut self.path_input, key);
+                }
             }
         }
     }
@@ -607,6 +720,7 @@ impl App {
                         self.rebuild_jobs();
                     }
                     KeyCode::Char('r') => self.start_rip(),
+                    KeyCode::Char('d') => self.change_drive(),
                     KeyCode::Char('q') => self.should_quit = true,
                     _ => {}
                 },
@@ -706,11 +820,13 @@ impl App {
         }
     }
 
-    /// Persist the TV and movie destinations, reporting the result.
+    /// Persist the TV and movie destinations and the last-used drive,
+    /// reporting the result.
     fn save_preferences(&mut self) {
         let config = Config {
             tv_dir: self.tv_path(),
             movie_dir: self.movie_path(),
+            last_device: self.last_device.clone(),
         };
         match config.save() {
             Ok(true) => self.config_note = Some("Preferences saved".into()),
@@ -842,7 +958,7 @@ impl App {
         if self.stage == Stage::Ripping
             && matches!(
                 &event,
-                WorkerEvent::DiscReady { .. } | WorkerEvent::NoDisc(_) | WorkerEvent::DiscError(_)
+                WorkerEvent::DiscReady { .. } | WorkerEvent::Drives(_) | WorkerEvent::DiscError(_)
             )
         {
             self.detect_loading = false;
@@ -878,6 +994,14 @@ impl App {
                 self.disc = Some(disc);
                 self.classification = Some(classification);
                 self.label = Some(label);
+                // Remember which drive this came from, so the next launch
+                // (and `watch`) can prefer it.
+                if let Some(device) = &device {
+                    if self.last_device.as_deref() != Some(device.as_path()) {
+                        self.last_device = Some(device.clone());
+                        self.save_preferences();
+                    }
+                }
                 self.device = device;
                 self.focus = Field::Jobs;
                 self.stage = Stage::Plan;
@@ -894,10 +1018,15 @@ impl App {
                     self.apply_edits();
                 }
             }
-            WorkerEvent::NoDisc(drives) => {
+            WorkerEvent::Drives(drives) => {
                 self.detect_loading = false;
                 self.scan_in_flight = false;
-                self.drives = drives;
+                let none_found = drives.is_empty();
+                self.set_drives(drives);
+                // With nothing to pick, put the caret in the manual path box.
+                if none_found && self.detect_focus == DetectField::Drives {
+                    self.detect_focus = DetectField::Path;
+                }
                 self.detect_note = None;
             }
             WorkerEvent::DiscError(e) => {
@@ -1114,7 +1243,13 @@ impl App {
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let hints: &[(&str, &str)] = match self.stage {
-            Stage::Detect => &[("Enter", "load path"), ("Esc", "quit")],
+            Stage::Detect => &[
+                ("Tab", "list/path"),
+                ("↑↓", "drive"),
+                ("Enter", "load"),
+                ("r", "rescan"),
+                ("Esc", "quit"),
+            ],
             Stage::Plan => &[
                 ("Tab", "field"),
                 ("↑↓", "select"),
@@ -1122,6 +1257,7 @@ impl App {
                 ("e", "extras"),
                 ("Enter", "apply"),
                 ("r", "rip"),
+                ("d", "change drive"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -1152,31 +1288,72 @@ impl App {
         }
 
         let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
-        let message = self.detect_note.clone().unwrap_or_else(|| {
-            "No disc found — enter a path to a mounted disc or its VIDEO_TS folder".into()
-        });
+
+        let path_focused = self.detect_focus == DetectField::Path;
         let input = Paragraph::new(self.path_input.as_str()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Disc path "),
+                .border_style(Style::default().fg(if path_focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }))
+                .title(" Disc path — Tab between this box and the drive list "),
         );
         f.render_widget(input, rows[0]);
-        set_cursor(f, rows[0], &self.path_input);
+        if path_focused {
+            set_cursor(f, rows[0], &self.path_input);
+        }
 
         let items: Vec<ListItem> = self
             .drives
             .iter()
-            .map(|d| {
-                let disc = if d.has_disc { "disc" } else { "no disc" };
-                ListItem::new(format!("{:<16} {}", d.device.display(), disc))
+            .map(|drive| {
+                let media = if drive.has_disc { "disc" } else { "no disc" };
+                let label = drive.label().unwrap_or_default();
+                let mount = drive
+                    .mount
+                    .as_ref()
+                    .map(|m| m.display().to_string())
+                    .unwrap_or_else(|| "—".into());
+                ListItem::new(format!(
+                    "{:<14}  {:<8}  {:<24}  {}",
+                    drive.device.display(),
+                    media,
+                    label,
+                    mount
+                ))
             })
             .collect();
-        let title = format!(" Drives ({}) — {} ", self.drives.len(), message);
-        f.render_widget(
-            List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
-            rows[1],
-        );
+
+        let drives_focused = self.detect_focus == DetectField::Drives;
+        let message = self.detect_note.clone().unwrap_or_else(|| {
+            if self.drives.is_empty() {
+                "no optical drives — type a path above".into()
+            } else if drives_focused {
+                "↑↓ choose · Enter load · r rescan".into()
+            } else {
+                "Enter loads the typed path".into()
+            }
+        });
+        let mut state = ListState::default();
+        if drives_focused && !self.drives.is_empty() {
+            state.select(Some(self.drive_cursor));
+        }
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if drives_focused {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }))
+                    .title(format!(" Drives ({}) — {} ", self.drives.len(), message)),
+            )
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).bold())
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, rows[1], &mut state);
     }
 
     fn render_plan(&self, f: &mut Frame, area: Rect) {
@@ -1623,7 +1800,7 @@ impl App {
     }
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
-        let popup = centered(area, 62, 16);
+        let popup = centered(area, 62, 18);
         f.render_widget(Clear, popup);
         let lines = vec![
             Line::from(Span::styled(
@@ -1631,13 +1808,14 @@ impl App {
                 Style::default().fg(Color::Cyan).bold(),
             )),
             Line::raw(""),
-            Line::from("Tab / Shift+Tab   move between fields"),
-            Line::from("↑ / ↓             select a file"),
+            Line::from("Tab / Shift+Tab   move between fields or the drive list"),
+            Line::from("↑ / ↓             select a drive or file"),
             Line::from("Space             include / skip a file"),
             Line::from("a                 include / skip all (plan) · abort now (ripping)"),
             Line::from("e                 include extras"),
-            Line::from("Enter             apply the show, season and directories"),
-            Line::from("r                 start backing up"),
+            Line::from("d                 change drive"),
+            Line::from("Enter             load a drive · apply the plan"),
+            Line::from("r                 rescan drives · start backing up"),
             Line::from("q / Esc           quit (while ripping: stop after this file)"),
             Line::from("Ctrl+C            stop now and quit"),
             Line::raw(""),
@@ -1667,37 +1845,75 @@ struct RipJob {
     path: PathBuf,
 }
 
-fn detect_and_load(tx: Sender<WorkerEvent>) {
+/// Probe drives and, when the choice is unambiguous, load the disc. A
+/// remembered drive wins; otherwise a single ready disc loads straight in and
+/// several ready discs are left for the picker.
+fn detect_and_load(tx: Sender<WorkerEvent>, preferred: Option<PathBuf>) {
     std::thread::spawn(move || {
         let drives = packrat_core::drives::list();
-        let ready = drives
+        let ready: Vec<OpticalDrive> = drives
             .iter()
-            .find(|d| d.has_disc && d.mount.is_some())
-            .cloned();
-        match ready {
-            Some(drive) => {
-                let mount = drive.mount.clone().expect("checked above");
-                let device = Some(drive.device.clone());
-                match load_disc(&mount, device.as_deref()) {
-                    Ok((source, disc, classification, label)) => {
-                        let _ = tx.send(WorkerEvent::DiscReady {
-                            source,
-                            disc,
-                            classification,
-                            label,
-                            device,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(WorkerEvent::DiscError(e));
-                    }
-                }
-            }
+            .filter(|drive| drive.has_disc && drive.mount.is_some())
+            .cloned()
+            .collect();
+
+        let chosen = preferred
+            .as_ref()
+            .and_then(|device| ready.iter().find(|drive| &drive.device == device).cloned())
+            .or_else(|| (ready.len() == 1).then(|| ready[0].clone()));
+
+        match chosen {
+            Some(drive) => load_drive_inner(tx, drive),
             None => {
-                let _ = tx.send(WorkerEvent::NoDisc(drives));
+                let _ = tx.send(WorkerEvent::Drives(drives));
             }
         }
     });
+}
+
+/// Load the drive the user picked from the list.
+fn load_drive(tx: Sender<WorkerEvent>, device: PathBuf, mount: PathBuf) {
+    std::thread::spawn(move || {
+        load_drive_inner(
+            tx,
+            OpticalDrive {
+                device,
+                mount: Some(mount),
+                has_disc: true,
+            },
+        );
+    });
+}
+
+/// Refresh the drive list without loading anything.
+fn list_drives(tx: Sender<WorkerEvent>) {
+    std::thread::spawn(move || {
+        let _ = tx.send(WorkerEvent::Drives(packrat_core::drives::list()));
+    });
+}
+
+/// Read a drive's disc and report it back to the UI.
+fn load_drive_inner(tx: Sender<WorkerEvent>, drive: OpticalDrive) {
+    let Some(mount) = drive.mount.clone() else {
+        // Unmounted media: hand the list back so the picker stays usable.
+        let _ = tx.send(WorkerEvent::Drives(vec![drive]));
+        return;
+    };
+    let device = Some(drive.device.clone());
+    match load_disc(&mount, device.as_deref()) {
+        Ok((source, disc, classification, label)) => {
+            let _ = tx.send(WorkerEvent::DiscReady {
+                source,
+                disc,
+                classification,
+                label,
+                device,
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerEvent::DiscError(e));
+        }
+    }
 }
 
 fn load_disc(
@@ -2328,7 +2544,7 @@ mod tests {
         app.stage = Stage::Ripping;
         app.scan_in_flight = true;
 
-        app.on_worker(WorkerEvent::NoDisc(Vec::new()));
+        app.on_worker(WorkerEvent::Drives(Vec::new()));
 
         assert!(matches!(app.stage, Stage::Ripping));
         assert!(!app.scan_in_flight);
@@ -2529,6 +2745,118 @@ mod tests {
         assert!(
             row.contains("<o,o)"),
             "expected the compact ASCII mouse: {row:?}"
+        );
+    }
+
+    fn drive(device: &str, has_disc: bool, mount: Option<&str>) -> OpticalDrive {
+        OpticalDrive {
+            device: PathBuf::from(device),
+            mount: mount.map(PathBuf::from),
+            has_disc,
+        }
+    }
+
+    #[test]
+    fn picker_prefers_the_remembered_device() {
+        let mut app = App::initial();
+        app.last_device = Some(PathBuf::from("/dev/sr1"));
+
+        app.set_drives(vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ]);
+
+        assert_eq!(app.drive_cursor, 1);
+    }
+
+    #[test]
+    fn picker_falls_back_to_the_first_ready_disc() {
+        let mut app = App::initial();
+
+        app.set_drives(vec![
+            drive("/dev/sr0", false, None),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ]);
+
+        assert_eq!(app.drive_cursor, 1);
+    }
+
+    #[test]
+    fn picker_keeps_the_highlighted_drive_across_refreshes() {
+        let mut app = App::initial();
+        app.set_drives(vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ]);
+        app.drive_cursor = 0;
+
+        // A rescan that returns the same drives must not move the cursor.
+        app.set_drives(vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ]);
+
+        assert_eq!(app.drive_cursor, 0);
+    }
+
+    #[test]
+    fn picker_keys_move_and_switch_focus() {
+        let mut app = App::initial();
+        app.set_drives(vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ]);
+        app.drive_cursor = 0;
+        app.detect_focus = DetectField::Drives;
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.drive_cursor, 1);
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.drive_cursor, 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.detect_focus, DetectField::Path);
+    }
+
+    #[test]
+    fn change_drive_returns_to_the_picker() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+
+        app.change_drive();
+
+        assert_eq!(app.stage, Stage::Detect);
+        assert_eq!(app.detect_focus, DetectField::Drives);
+    }
+
+    #[test]
+    fn detect_screen_renders_the_drive_picker() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        app.detect_focus = DetectField::Drives;
+        app.set_drives(vec![
+            drive("/dev/sr0", true, Some("/run/media/user/DISC_A")),
+            drive("/dev/sr1", false, None),
+        ]);
+        app.drive_cursor = 0;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol())
+            .collect();
+
+        assert!(screen.contains("/dev/sr0"), "{screen}");
+        assert!(screen.contains("DISC_A"), "{screen}");
+        assert!(screen.contains("no disc"), "{screen}");
+        assert!(
+            screen.contains("▶"),
+            "the cursor highlights a row: {screen}"
         );
     }
 }

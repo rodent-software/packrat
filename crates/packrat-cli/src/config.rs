@@ -18,6 +18,8 @@ pub struct Config {
     pub tv_dir: Option<PathBuf>,
     /// Directory holding movie folders, e.g. `/mnt/dvd/media/movies`.
     pub movie_dir: Option<PathBuf>,
+    /// Optical drive last used in the interactive guide, e.g. `/dev/sr1`.
+    pub last_device: Option<PathBuf>,
 }
 
 impl Config {
@@ -51,6 +53,7 @@ impl Config {
             match key.trim() {
                 "tv_dir" => config.tv_dir = Some(expand_tilde(&value)),
                 "movie_dir" => config.movie_dir = Some(expand_tilde(&value)),
+                "last_device" => config.last_device = Some(expand_tilde(&value)),
                 _ => {}
             }
         }
@@ -70,6 +73,12 @@ impl Config {
             out.push_str(&format!(
                 "movie_dir = \"{}\"\n",
                 escape(&dir.to_string_lossy())
+            ));
+        }
+        if let Some(device) = &self.last_device {
+            out.push_str(&format!(
+                "last_device = \"{}\"\n",
+                escape(&device.to_string_lossy())
             ));
         }
         out
@@ -177,6 +186,7 @@ mod tests {
 # a comment
 tv_dir = \"/mnt/dvd/media/tv\"
 movie_dir = '/mnt/dvd/media/movies'
+last_device = \"/dev/sr1\"
 unknown = 3
 ";
         let config = Config::parse(text);
@@ -188,6 +198,7 @@ unknown = 3
             config.movie_dir.as_deref(),
             Some(Path::new("/mnt/dvd/media/movies"))
         );
+        assert_eq!(config.last_device.as_deref(), Some(Path::new("/dev/sr1")));
         assert_eq!(Config::parse(&config.render()), config);
     }
 
@@ -196,6 +207,7 @@ unknown = 3
         let config = Config {
             tv_dir: Some(PathBuf::from("C:\\Media\\TV \"x\"")),
             movie_dir: None,
+            last_device: Some(PathBuf::from("\\\\.\\D:")),
         };
         assert_eq!(Config::parse(&config.render()), config);
     }

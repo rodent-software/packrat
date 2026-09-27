@@ -80,9 +80,20 @@ packrat drives
 # Watch for a disc and back it up automatically (Ctrl-C to stop)
 packrat watch --library /mnt/media --include-extras
 
+# With more than one drive attached, pin the one to watch
+packrat watch --device /dev/sr1 --library /mnt/media
+
 # --once processes a present disc and exits; --dry-run previews
 packrat watch --once --dry-run --library /mnt/media
 ```
+
+Without `--device`, `watch` prefers the drive last used in the interactive
+guide and otherwise takes the first one holding a disc.
+
+In the guide itself the drive list is selectable: `Tab` moves between the list
+and the manual path box, `↑`/`↓` pick a drive, `Enter` loads it and `r`
+rescans. Press `d` while reviewing a plan to switch to another drive without
+restarting.
 
 ## How output is written
 

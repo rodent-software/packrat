@@ -15,7 +15,7 @@ use packrat_core::{
     alternates, classify, episode_file_in, episode_range_file_in, extra_file_in, match_episodes,
     match_span, movie_file_in, parse_label, preferred_titles, read_disc, read_vts, remux_chain,
     search_show, split_title, DiscKind, DiscModel, DiscSource, Episode, EpisodeMatch, EpisodeSpan,
-    Show, Title, EXTRA_MIN, MIN_CONTENT,
+    OpticalDrive, Show, Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 #[derive(Parser)]
@@ -136,7 +136,7 @@ enum Command {
     Drives,
     /// Watch for a disc and back it up when one appears.
     #[command(
-        after_help = "Examples:\n  packrat watch --library /mnt/media --include-extras\n  packrat watch --once --dry-run --library /mnt/media"
+        after_help = "Examples:\n  packrat watch --library /mnt/media --include-extras\n  packrat watch --once --dry-run --library /mnt/media\n  packrat watch --device /dev/sr1 --library /mnt/media"
     )]
     Watch {
         /// Library root to write into (adds `TV Shows/` and `Movies/`).
@@ -150,6 +150,10 @@ enum Command {
         /// saved preference.
         #[arg(long)]
         movie_dir: Option<PathBuf>,
+        /// Only watch this optical drive, e.g. `/dev/sr1`. Defaults to the
+        /// drive last used in the guide, else the first with a disc.
+        #[arg(long, alias = "drive")]
+        device: Option<PathBuf>,
         /// Poll interval in seconds.
         #[arg(long, default_value_t = 5)]
         interval: u64,
@@ -222,6 +226,7 @@ fn main() -> Result<()> {
             library,
             tv_dir,
             movie_dir,
+            device,
             interval,
             include_extras,
             once,
@@ -229,7 +234,14 @@ fn main() -> Result<()> {
         }) => {
             let dest =
                 resolve_destinations(library.as_deref(), tv_dir.as_deref(), movie_dir.as_deref());
-            watch(&dest, interval, include_extras, once, dry_run)
+            watch(
+                &dest,
+                device.as_deref(),
+                interval,
+                include_extras,
+                once,
+                dry_run,
+            )
         }
     }
 }
@@ -880,24 +892,57 @@ fn drives() -> Result<()> {
     Ok(())
 }
 
+/// Pick the drive for `watch` to process: the requested one, else the first
+/// with a mounted disc.
+fn select_watch_drive<'a>(
+    drives: &'a [OpticalDrive],
+    requested: Option<&Path>,
+) -> Option<&'a OpticalDrive> {
+    drives.iter().find(|drive| {
+        let matches_requested = match requested {
+            Some(requested) => drive.device.as_path() == requested,
+            None => true,
+        };
+        drive.has_disc && drive.mount.is_some() && matches_requested
+    })
+}
+
 /// Watch optical drives and back up a disc when it appears.
 ///
 /// Reuses the same `split` pipeline, so naming, detection and extras behave
-/// identically to a manual run.
+/// identically to a manual run. `device` pins the drive to watch; without it
+/// the drive last used in the guide is preferred, falling back to the first
+/// one with a disc.
 fn watch(
     dest: &Destinations,
+    device: Option<&Path>,
     interval: u64,
     include_extras: bool,
     once: bool,
     dry_run: bool,
 ) -> Result<()> {
+    let explicit = device.map(Path::to_path_buf);
+    let remembered = Config::load().last_device;
+
     let mut last_processed: Option<PathBuf> = None;
 
     loop {
         let drives = packrat_core::drives::list();
-        let ready = drives.iter().find(|d| d.has_disc && d.mount.is_some());
 
-        match ready {
+        // An explicit drive must exist; a remembered one may have been
+        // unplugged, in which case we fall back to any ready drive.
+        if let Some(explicit) = &explicit {
+            if !drives.iter().any(|drive| &drive.device == explicit) {
+                anyhow::bail!("no optical drive at {}", explicit.display());
+            }
+        }
+        let chosen = match &explicit {
+            Some(explicit) => select_watch_drive(&drives, Some(explicit)),
+            None => select_watch_drive(&drives, remembered.as_deref())
+                .or_else(|| select_watch_drive(&drives, None)),
+        };
+
+        match chosen {
             Some(drive) => {
                 let mount = drive.mount.clone().expect("checked above");
                 if last_processed.as_ref() != Some(&mount) {
@@ -931,7 +976,10 @@ fn watch(
                 }
             }
             None if once => {
-                println!("No disc present.");
+                match &explicit {
+                    Some(device) => println!("No disc in {}.", device.display()),
+                    None => println!("No disc present."),
+                }
                 return Ok(());
             }
             None => {}
@@ -1065,5 +1113,42 @@ mod tests {
         let hints = disc_episode_hints(&episodes, 1, &disc, &preferred, Some(1));
         assert_eq!(hints[&1], 0);
         assert_eq!(hints[&6], 5);
+    }
+
+    fn drive(device: &str, has_disc: bool, mount: Option<&str>) -> OpticalDrive {
+        OpticalDrive {
+            device: PathBuf::from(device),
+            mount: mount.map(PathBuf::from),
+            has_disc,
+        }
+    }
+
+    #[test]
+    fn watch_drive_selection_respects_the_requested_device() {
+        let drives = vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ];
+        let chosen = select_watch_drive(&drives, Some(Path::new("/dev/sr1"))).expect("selected");
+        assert_eq!(chosen.device, PathBuf::from("/dev/sr1"));
+    }
+
+    #[test]
+    fn watch_drive_selection_defaults_to_the_first_ready_disc() {
+        let drives = vec![
+            drive("/dev/sr0", false, None),
+            drive("/dev/sr1", true, Some("/mnt/b")),
+        ];
+        let chosen = select_watch_drive(&drives, None).expect("selected");
+        assert_eq!(chosen.device, PathBuf::from("/dev/sr1"));
+    }
+
+    #[test]
+    fn watch_drive_selection_waits_when_the_requested_drive_has_no_disc() {
+        let drives = vec![
+            drive("/dev/sr0", true, Some("/mnt/a")),
+            drive("/dev/sr1", false, None),
+        ];
+        assert!(select_watch_drive(&drives, Some(Path::new("/dev/sr1"))).is_none());
     }
 }

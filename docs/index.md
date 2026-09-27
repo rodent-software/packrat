@@ -14,6 +14,8 @@ Running with no subcommand opens the interactive guide. It detects the disc,
 shows what it thinks it is, and asks before writing anything. From there you
 can:
 
+- pick which drive to read when more than one is attached (`Tab`, `↑`/`↓`,
+  `Enter`), and switch drives from a plan with `d`
 - correct the **show** and **season** (packrat searches TVmaze for the name)
 - set the **TV directory** and **movie directory** to the folders that already
   hold your show and movie folders, such as an existing Plex library

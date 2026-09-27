@@ -14,13 +14,18 @@ Running with no subcommand opens the interactive guide. It detects the disc,
 shows what it thinks it is, and asks before writing anything. From there you
 can:
 
-- pick which drive to read when more than one is attached (`Tab`, `↑`/`↓`,
-  `Enter`), and switch drives from a plan with `d`
-- correct the **show** and **season** (packrat searches TVmaze for the name)
 - set the **TV directory** and **movie directory** to the folders that already
   hold your show and movie folders, such as an existing Plex library
-  (`/mnt/media/tv`, `/mnt/media/movies`). They are remembered between runs.
+  (`/mnt/media/tv`, `/mnt/media/movies`). On the first run packrat opens the
+  settings screen for this; press `s` to reopen it later. They are remembered
+  between runs.
+- pick which drive to read when more than one is attached (`Tab`, `↑`/`↓`,
+  `Enter`), and switch drives from a plan with `d`
+- correct the **show** and **season** if TVmaze guessed wrong (packrat searches
+  TVmaze for the name)
 - include or skip individual files, and add **extras** (trailers/featurettes)
+- press `x` to open the tray, or enable **Eject when done** in settings (`s`)
+  to eject automatically after a clean rip
 - press `Enter` to apply edits and `r` to rip
 
 Files are written straight into the configured directory with Plex's naming:
@@ -34,12 +39,15 @@ Leave a directory empty to write plain MKVs into the current directory instead.
 
 A typical session:
 
-1. Run `packrat` with a disc inserted.
-2. Type your TV directory (or movie directory) and press `Enter` — packrat
-   saves it and looks the disc up on TVmaze.
+1. Run `packrat` with a disc inserted. On the first run, set your TV and movie
+   directories on the settings screen and press `Enter` to save and continue.
+2. Check the disc packrat found and correct the show or season if it guessed
+   wrong (`Enter` re-runs the TVmaze lookup).
 3. Check the proposed files, unchecking anything you do not want (`Space`).
 4. Press `r` to back up. Progress is shown per file, and `q` stops after the
-   current file.
+   current file. With **Eject when done** enabled the tray opens once it
+   finishes cleanly; otherwise press `x` on the result screen.
 
-`Tab` moves between fields and `?` shows the full key list. The guide needs a
-terminal; for scripting and headless use see [Advanced usage](advanced.md).
+`Tab` moves between fields and `?` shows the full key list. Press `s` to change
+the storage directories at any time. The guide needs a terminal; for scripting
+and headless use see [Advanced usage](advanced.md).

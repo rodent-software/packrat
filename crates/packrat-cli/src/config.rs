@@ -1,8 +1,9 @@
 //! User preferences, persisted between runs.
 //!
 //! This is deliberately a tiny `key = "value"` file rather than a general
-//! parser: packrat only remembers two directory preferences. Unknown keys and
-//! malformed lines are ignored so a hand-edited file never breaks a run.
+//! parser: packrat only remembers one destination directory per media type.
+//! Unknown keys and malformed lines are ignored so a hand-edited file never
+//! breaks a run.
 
 use std::path::PathBuf;
 
@@ -20,6 +21,8 @@ pub struct Config {
     pub movie_dir: Option<PathBuf>,
     /// Optical drive last used in the interactive guide, e.g. `/dev/sr1`.
     pub last_device: Option<PathBuf>,
+    /// Open the tray once a rip finishes without failures.
+    pub auto_eject: bool,
 }
 
 impl Config {
@@ -54,6 +57,7 @@ impl Config {
                 "tv_dir" => config.tv_dir = Some(expand_tilde(&value)),
                 "movie_dir" => config.movie_dir = Some(expand_tilde(&value)),
                 "last_device" => config.last_device = Some(expand_tilde(&value)),
+                "auto_eject" => config.auto_eject = parse_bool(&value),
                 _ => {}
             }
         }
@@ -81,6 +85,9 @@ impl Config {
                 escape(&device.to_string_lossy())
             ));
         }
+        if self.auto_eject {
+            out.push_str("auto_eject = true\n");
+        }
         out
     }
 
@@ -106,6 +113,12 @@ impl Config {
 /// Path of the preferences file, e.g. `~/.config/packrat/config.toml`.
 pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("packrat").join("config.toml"))
+}
+
+/// Whether preferences have been saved yet. A first-time user has no file, so
+/// the guide can walk them through the settings screen before scanning.
+pub fn exists() -> bool {
+    config_path().is_some_and(|path| path.exists())
 }
 
 /// Platform configuration directory.
@@ -135,6 +148,14 @@ pub fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// Read a generous set of truthy spellings; anything else is `false`.
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 fn escape(value: &str) -> String {
@@ -187,6 +208,7 @@ mod tests {
 tv_dir = \"/mnt/dvd/media/tv\"
 movie_dir = '/mnt/dvd/media/movies'
 last_device = \"/dev/sr1\"
+auto_eject = true
 unknown = 3
 ";
         let config = Config::parse(text);
@@ -199,7 +221,23 @@ unknown = 3
             Some(Path::new("/mnt/dvd/media/movies"))
         );
         assert_eq!(config.last_device.as_deref(), Some(Path::new("/dev/sr1")));
+        assert!(config.auto_eject);
         assert_eq!(Config::parse(&config.render()), config);
+    }
+
+    #[test]
+    fn parses_auto_eject_spellings() {
+        for text in [
+            "auto_eject = true",
+            "auto_eject = 1",
+            "auto_eject = yes",
+            "auto_eject = on",
+        ] {
+            assert!(Config::parse(text).auto_eject, "{text:?}");
+        }
+        assert!(!Config::parse("auto_eject = false").auto_eject);
+        assert!(!Config::parse("auto_eject =").auto_eject);
+        assert!(!Config::default().auto_eject);
     }
 
     #[test]
@@ -208,6 +246,7 @@ unknown = 3
             tv_dir: Some(PathBuf::from("C:\\Media\\TV \"x\"")),
             movie_dir: None,
             last_device: Some(PathBuf::from("\\\\.\\D:")),
+            auto_eject: true,
         };
         assert_eq!(Config::parse(&config.render()), config);
     }

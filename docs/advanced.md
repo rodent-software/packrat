@@ -47,7 +47,8 @@ packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out \
   --tv-dir /mnt/dvd/media/tv --dry-run
 ```
 
-Set them once in the [interactive guide](index.md) and they are saved to
+Set them once on the [interactive guide](index.md)'s settings screen — press
+`s`, or set them during first-run onboarding — and they are saved to
 `~/.config/packrat/config.toml` (or `$XDG_CONFIG_HOME/packrat/config.toml`).
 Headless commands pick the saved values up automatically, so this is enough:
 
@@ -59,6 +60,13 @@ packrat watch --include-extras
 <root>/Movies`, for libraries laid out with Plex's conventional category
 folders. An explicit flag wins over `--library`, which wins over a saved
 preference.
+
+The settings screen also has **Eject when done**, which opens the tray once a
+rip finishes without failures. Press `x` to eject on demand: from a plan it
+opens the loaded disc's tray and returns to the picker, and on the result
+screen it ejects and goes straight back to configure another disc. While a rip
+is running the tray is locked (where the OS supports it) so it cannot be opened
+mid-read.
 
 ## Encrypted discs
 

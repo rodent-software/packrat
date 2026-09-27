@@ -111,6 +111,7 @@ pub fn run() -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
+    Config,
     Detect,
     Plan,
     Ripping,
@@ -121,9 +122,66 @@ enum Stage {
 enum Field {
     Show,
     Season,
+    Jobs,
+}
+
+/// A setting shown on the config screen.
+///
+/// Destinations live here rather than on the scan screen so a new media type
+/// (CDs, for example) only has to add a variant and a [`Config`] field, not a
+/// new row to the scan layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigField {
     TvDir,
     MovieDir,
-    Jobs,
+    AutoEject,
+}
+
+impl ConfigField {
+    /// Every setting, in tab order. This is the one list to extend when a new
+    /// media type gains its own destination.
+    const ALL: [ConfigField; 3] = [
+        ConfigField::TvDir,
+        ConfigField::MovieDir,
+        ConfigField::AutoEject,
+    ];
+
+    fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    fn prev(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Whether this row is a checkbox rather than a text field.
+    fn is_toggle(self) -> bool {
+        matches!(self, Self::AutoEject)
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::TvDir => " TV directory ",
+            Self::MovieDir => " Movie directory ",
+            Self::AutoEject => " Eject when done ",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::TvDir => "the folder that holds show folders, e.g. /mnt/media/tv",
+            Self::MovieDir => "the folder that holds movie folders, e.g. /mnt/media/movies",
+            Self::AutoEject => "Eject the disc automatically once a rip finishes",
+        }
+    }
 }
 
 /// Which control the Detect screen is editing.
@@ -139,9 +197,7 @@ impl Field {
     fn next(self) -> Self {
         match self {
             Self::Show => Self::Season,
-            Self::Season => Self::TvDir,
-            Self::TvDir => Self::MovieDir,
-            Self::MovieDir => Self::Jobs,
+            Self::Season => Self::Jobs,
             Self::Jobs => Self::Show,
         }
     }
@@ -150,9 +206,7 @@ impl Field {
         match self {
             Self::Show => Self::Jobs,
             Self::Season => Self::Show,
-            Self::TvDir => Self::Season,
-            Self::MovieDir => Self::TvDir,
-            Self::Jobs => Self::MovieDir,
+            Self::Jobs => Self::Season,
         }
     }
 }
@@ -303,6 +357,9 @@ enum WorkerEvent {
     RipDone {
         cancelled: bool,
     },
+    EjectDone {
+        result: Result<(), String>,
+    },
 }
 
 /// The latest progress from the file currently being ripped.
@@ -360,12 +417,29 @@ struct App {
     #[allow(dead_code)]
     device: Option<PathBuf>,
 
+    // Settings (config screen)
+    config_focus: ConfigField,
+    /// Where the config screen returns to when it closes.
+    config_return: Stage,
+    /// First run: there was no config file, so the screen is onboarding rather
+    /// than a settings visit.
+    config_onboarding: bool,
+    config_note: Option<String>,
+
     // Editable plan
     show_input: TextInput,
     season_input: TextInput,
     tv_input: TextInput,
     movie_input: TextInput,
-    config_note: Option<String>,
+    /// Open the tray automatically when a rip finishes cleanly.
+    auto_eject: bool,
+    /// A rip or an explicit command has opened the tray; the loaded disc is
+    /// gone even though its plan is still on screen.
+    ejected: bool,
+    /// After a successful eject, fall back to the drive picker rather than
+    /// staying on the current screen.
+    eject_then_picker: bool,
+    eject_note: Option<String>,
     include_extras: bool,
     naming: Option<Naming>,
     meta_show: Option<Show>,
@@ -390,7 +464,12 @@ impl App {
     fn new(shutdown: Arc<AtomicBool>) -> Self {
         let mut app = Self::initial();
         app.shutdown = shutdown;
-        app.begin_detection(true);
+        if config::exists() {
+            app.begin_detection(true);
+        } else {
+            // First run: set up the storage directories before scanning.
+            app.start_onboarding();
+        }
         app
     }
 
@@ -428,7 +507,14 @@ impl App {
             season_input: TextInput::default(),
             tv_input,
             movie_input,
+            config_focus: ConfigField::TvDir,
+            config_return: Stage::Detect,
+            config_onboarding: false,
             config_note: None,
+            auto_eject: config.auto_eject,
+            ejected: false,
+            eject_then_picker: false,
+            eject_note: None,
             include_extras: false,
             naming: None,
             meta_show: None,
@@ -492,6 +578,113 @@ impl App {
         self.refresh_drives();
     }
 
+    // -- Settings (config screen) -----------------------------------------
+
+    /// First run: open the settings screen before any disc scan, so the
+    /// destination directories are set up front. Saving writes the config,
+    /// which is what ends onboarding on the next launch.
+    fn start_onboarding(&mut self) {
+        self.config_return = Stage::Detect;
+        self.config_onboarding = true;
+        self.config_focus = ConfigField::TvDir;
+        self.config_note = None;
+        self.stage = Stage::Config;
+    }
+
+    /// Open the settings screen from the guide, remembering where to return.
+    fn open_config(&mut self) {
+        self.config_return = self.stage;
+        self.config_onboarding = false;
+        self.config_focus = ConfigField::TvDir;
+        self.config_note = None;
+        self.stage = Stage::Config;
+    }
+
+    /// Leave the settings screen and resume the prior view. Persisting is the
+    /// caller's job; this only restores the view and refreshes what depends on
+    /// the destinations.
+    fn close_config(&mut self) {
+        self.stage = self.config_return;
+        match self.stage {
+            Stage::Detect => self.begin_detection(self.disc.is_none()),
+            Stage::Plan => self.apply_edits(),
+            _ => {}
+        }
+    }
+
+    /// The text field behind a config row.
+    fn config_input(&self, field: ConfigField) -> &TextInput {
+        match field {
+            ConfigField::TvDir => &self.tv_input,
+            ConfigField::MovieDir => &self.movie_input,
+            ConfigField::AutoEject => unreachable!("the eject toggle is not a text field"),
+        }
+    }
+
+    fn config_input_mut(&mut self, field: ConfigField) -> &mut TextInput {
+        match field {
+            ConfigField::TvDir => &mut self.tv_input,
+            ConfigField::MovieDir => &mut self.movie_input,
+            ConfigField::AutoEject => unreachable!("the eject toggle is not a text field"),
+        }
+    }
+
+    /// Discard unsaved settings edits by restoring the persisted values.
+    fn reload_config_inputs(&mut self) {
+        let config = Config::load();
+        self.tv_input = TextInput::from(&display_path(config.tv_dir.as_deref()));
+        self.movie_input = TextInput::from(&display_path(config.movie_dir.as_deref()));
+        self.auto_eject = config.auto_eject;
+    }
+
+    // -- Tray control -----------------------------------------------------
+
+    /// Eject `device` on a worker thread so the UI never blocks on the ioctl or
+    /// the fallback command-line tool. `then_picker` returns to the drive
+    /// picker on success; otherwise the current screen stays put.
+    fn eject_drive(&mut self, device: PathBuf, then_picker: bool) {
+        self.eject_note = None;
+        self.eject_then_picker = then_picker;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = packrat_core::drives::eject(&device);
+            let _ = tx.send(WorkerEvent::EjectDone { result });
+        });
+    }
+
+    /// Eject the drive the loaded disc came from, if it is a real drive.
+    fn eject_loaded_disc(&mut self, then_picker: bool) {
+        match self.device.clone() {
+            Some(device) => self.eject_drive(device, then_picker),
+            None => self.meta_note = Some("No drive to eject for a path-loaded disc".into()),
+        }
+    }
+
+    /// Eject the drive highlighted in the picker.
+    fn eject_selected_drive(&mut self) {
+        let Some(drive) = self.drives.get(self.drive_cursor) else {
+            self.detect_note = Some("No drive selected".into());
+            return;
+        };
+        if !drive.has_disc {
+            self.detect_note = Some(format!("{} has no disc", drive.device.display()));
+            return;
+        }
+        self.detect_note = None;
+        self.eject_drive(drive.device.clone(), false);
+    }
+
+    /// The success screen's "eject and configure another": open the tray, then
+    /// return to the picker when the eject lands.
+    fn eject_and_configure(&mut self) {
+        if self.ejected || self.device.is_none() {
+            // Nothing to open (or it is already open): just move on.
+            self.back_to_plan();
+        } else {
+            self.eject_loaded_disc(true);
+        }
+    }
+
     /// Whether the drive the loaded disc came from still reports ready media.
     /// A manually loaded path is not tied to a drive, so it is assumed present.
     fn loaded_drive_ready(&self, drives: &[OpticalDrive]) -> bool {
@@ -520,6 +713,9 @@ impl App {
         self.job_cursor = 0;
         self.show_input = TextInput::default();
         self.season_input = TextInput::default();
+        self.ejected = false;
+        self.eject_then_picker = false;
+        self.eject_note = None;
         self.detect_note = Some("Disc ejected — insert a disc or choose a drive".into());
         self.detect_focus = DetectField::Drives;
         self.stage = Stage::Detect;
@@ -633,12 +829,13 @@ impl App {
             self.show_help = false;
             return;
         }
-        if key.code == KeyCode::Char('?') && self.stage != Stage::Detect {
+        if key.code == KeyCode::Char('?') && !matches!(self.stage, Stage::Detect | Stage::Config) {
             self.show_help = true;
             return;
         }
 
         match self.stage {
+            Stage::Config => self.on_key_config(key),
             Stage::Detect => self.on_key_detect(key),
             Stage::Plan => self.on_key_plan(key),
             Stage::Ripping => match key.code {
@@ -654,11 +851,46 @@ impl App {
             },
             Stage::Done => match key.code {
                 KeyCode::Char('c') => self.back_to_plan(),
+                KeyCode::Char('x') => self.eject_and_configure(),
                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char(' ') => {
                     self.should_quit = true;
                 }
                 _ => {}
             },
+        }
+    }
+
+    /// The settings screen: edit a directory, save and continue, or back out.
+    fn on_key_config(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Tab => self.config_focus = self.config_focus.next(),
+            KeyCode::BackTab => self.config_focus = self.config_focus.prev(),
+            KeyCode::Enter => match self.persist_config() {
+                Ok(_) => self.close_config(),
+                Err(e) => self.config_note = Some(format!("Could not save settings: {e}")),
+            },
+            KeyCode::Esc => {
+                // Leaving without saving drops the edits; a first-time user has
+                // nothing to restore, so this just skips onboarding.
+                if !self.config_onboarding {
+                    self.reload_config_inputs();
+                }
+                self.close_config();
+            }
+            _ => {
+                let focus = self.config_focus;
+                if focus.is_toggle() {
+                    // Space (or either arrow) flips the checkbox.
+                    if matches!(
+                        key.code,
+                        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                    ) {
+                        self.auto_eject = !self.auto_eject;
+                    }
+                } else {
+                    edit_input(self.config_input_mut(focus), key);
+                }
+            }
         }
     }
 
@@ -690,6 +922,16 @@ impl App {
             KeyCode::Char('r') if self.detect_focus == DetectField::Drives => {
                 self.refresh_drives();
             }
+            // Open the settings screen; while typing a path, `s` is just a
+            // character.
+            KeyCode::Char('s') if self.detect_focus == DetectField::Drives => {
+                self.open_config();
+            }
+            // Eject the highlighted drive; while typing a path, `x` is a
+            // character.
+            KeyCode::Char('x') if self.detect_focus == DetectField::Drives => {
+                self.eject_selected_drive();
+            }
             KeyCode::Esc => {
                 // Arriving here from a plan, Esc backs out instead of quitting.
                 if self.disc.is_some() {
@@ -719,15 +961,13 @@ impl App {
                 }
             }
             _ => match self.focus {
-                Field::Show | Field::Season | Field::TvDir | Field::MovieDir => {
+                Field::Show | Field::Season => {
                     if key.code == KeyCode::Enter {
                         self.apply_edits();
                     } else {
                         let input = match self.focus {
                             Field::Show => &mut self.show_input,
-                            Field::Season => &mut self.season_input,
-                            Field::TvDir => &mut self.tv_input,
-                            _ => &mut self.movie_input,
+                            _ => &mut self.season_input,
                         };
                         edit_input(input, key);
                     }
@@ -755,6 +995,8 @@ impl App {
                         self.rebuild_jobs();
                     }
                     KeyCode::Char('r') => self.start_rip(),
+                    KeyCode::Char('s') => self.open_config(),
+                    KeyCode::Char('x') => self.eject_loaded_disc(true),
                     KeyCode::Char('d') => self.change_drive(),
                     KeyCode::Char('q') => self.should_quit = true,
                     _ => {}
@@ -800,11 +1042,10 @@ impl App {
         });
     }
 
-    /// Recompute the metadata and job list after the user edits a field, and
-    /// remember the destination preferences.
+    /// Recompute the metadata and job list after the user edits the show or
+    /// season.
     fn apply_edits(&mut self) {
         self.meta_note = None;
-        self.save_preferences();
         let Some(disc) = self.disc.clone() else {
             return;
         };
@@ -855,19 +1096,16 @@ impl App {
         }
     }
 
-    /// Persist the TV and movie destinations and the last-used drive,
-    /// reporting the result.
-    fn save_preferences(&mut self) {
+    /// Persist the settings and the last-used drive. The config screen surfaces
+    /// the error; other callers are free to ignore it.
+    fn persist_config(&self) -> std::result::Result<bool, String> {
         let config = Config {
             tv_dir: self.tv_path(),
             movie_dir: self.movie_path(),
             last_device: self.last_device.clone(),
+            auto_eject: self.auto_eject,
         };
-        match config.save() {
-            Ok(true) => self.config_note = Some("Preferences saved".into()),
-            Ok(false) => {}
-            Err(e) => self.config_note = Some(format!("Could not save preferences: {e:#}")),
-        }
+        config.save().map_err(|e| format!("{e:#}"))
     }
 
     fn rebuild_jobs(&mut self) {
@@ -942,6 +1180,9 @@ impl App {
         self.failed = 0;
         self.cancelled = false;
         self.current = None;
+        self.ejected = false;
+        self.eject_then_picker = false;
+        self.eject_note = None;
         self.stage = Stage::Ripping;
         self.cancel.store(false, Ordering::Relaxed);
         self.abort.store(false, Ordering::Relaxed);
@@ -966,6 +1207,7 @@ impl App {
             source,
             disc,
             jobs,
+            self.device.clone(),
         ));
     }
 
@@ -981,6 +1223,12 @@ impl App {
             job.status = JobStatus::Pending;
         }
         self.meta_note = None;
+        // A disc that was ejected cannot be reconfigured, so fall back to the
+        // picker for the next one.
+        if self.ejected {
+            self.clear_disc();
+            return;
+        }
         self.focus = Field::Jobs;
         self.stage = Stage::Plan;
     }
@@ -1029,12 +1277,15 @@ impl App {
                 self.disc = Some(disc);
                 self.classification = Some(classification);
                 self.label = Some(label);
+                self.ejected = false;
+                self.eject_then_picker = false;
+                self.eject_note = None;
                 // Remember which drive this came from, so the next launch
                 // (and `watch`) can prefer it.
                 if let Some(device) = &device {
                     if self.last_device.as_deref() != Some(device.as_path()) {
                         self.last_device = Some(device.clone());
-                        self.save_preferences();
+                        let _ = self.persist_config();
                     }
                 }
                 self.device = device;
@@ -1158,9 +1409,42 @@ impl App {
                 self.stage = Stage::Done;
                 // The worker has sent its last event; join so a cancelled
                 // `.partial` file is gone before the result screen appears.
+                // That also releases the tray lock before an auto-eject.
                 self.finish_rip();
+                if self.auto_eject && self.device.is_some() && !cancelled && self.failed == 0 {
+                    self.eject_loaded_disc(false);
+                }
+            }
+            WorkerEvent::EjectDone { result } => {
+                self.handle_eject_done(result);
             }
         }
+    }
+
+    /// React to a finished tray command, landing wherever the request asked.
+    fn handle_eject_done(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.ejected = true;
+                self.eject_note = Some("Disc ejected".into());
+                if self.eject_then_picker {
+                    // The disc is gone: drop the plan and return to the picker.
+                    self.clear_disc();
+                } else if self.stage == Stage::Detect {
+                    self.refresh_drives();
+                }
+            }
+            Err(e) => {
+                let note = format!("Could not eject: {e}");
+                self.eject_note = Some(note.clone());
+                match self.stage {
+                    Stage::Plan => self.meta_note = Some(note),
+                    Stage::Detect => self.detect_note = Some(note),
+                    _ => {}
+                }
+            }
+        }
+        self.eject_then_picker = false;
     }
 
     // -- Rendering --------------------------------------------------------
@@ -1178,6 +1462,7 @@ impl App {
 
         self.render_header(f, rows[0]);
         match self.stage {
+            Stage::Config => self.render_config(f, rows[1]),
             Stage::Detect => self.render_detect(f, rows[1]),
             Stage::Plan => self.render_plan(f, rows[1]),
             Stage::Ripping => self.render_ripping(f, rows[1]),
@@ -1196,6 +1481,10 @@ impl App {
     /// cheese when finished, and cross-eyed when something goes wrong.
     fn rat_frame(&self) -> &'static [&'static str; 3] {
         match self.stage {
+            Stage::Config => {
+                const CYCLE: [&[&str; 3]; 4] = [&RAT_IDLE, &RAT_IDLE, &RAT_BLINK, &RAT_IDLE];
+                CYCLE[(self.tick / 3) % CYCLE.len()]
+            }
             Stage::Detect => {
                 if self.detect_note.is_some() {
                     &RAT_ERROR
@@ -1230,6 +1519,7 @@ impl App {
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
         let where_ = match self.stage {
+            Stage::Config => "settings",
             Stage::Detect => "finding a disc",
             Stage::Plan => "review",
             Stage::Ripping => "backing up",
@@ -1283,27 +1573,47 @@ impl App {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        let hints: &[(&str, &str)] = match self.stage {
-            Stage::Detect => &[
+        let hints: Vec<(&str, &str)> = match self.stage {
+            Stage::Config => vec![
+                ("Tab", "field"),
+                ("Enter", "save & continue"),
+                (
+                    "Esc",
+                    if self.config_onboarding {
+                        "skip"
+                    } else {
+                        "back"
+                    },
+                ),
+            ],
+            Stage::Detect => vec![
                 ("Tab", "list/path"),
                 ("↑↓", "drive"),
                 ("Enter", "load"),
                 ("r", "rescan"),
+                ("x", "eject"),
+                ("s", "settings"),
                 ("Esc", "quit"),
             ],
-            Stage::Plan => &[
+            Stage::Plan => vec![
                 ("Tab", "field"),
                 ("↑↓", "select"),
                 ("Space", "toggle"),
                 ("e", "extras"),
                 ("Enter", "apply"),
                 ("r", "rip"),
+                ("x", "eject"),
+                ("s", "settings"),
                 ("d", "change drive"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
-            Stage::Ripping => &[("q", "stop after this file"), ("a", "abort now")],
-            Stage::Done => &[("c", "configure another"), ("Enter", "quit")],
+            Stage::Ripping => vec![("q", "stop after this file"), ("a", "abort now")],
+            Stage::Done => vec![
+                ("c", "configure another"),
+                ("x", "eject & configure"),
+                ("Enter", "quit"),
+            ],
         };
         let mut spans = vec![Span::raw(" ")];
         for (i, (key, label)) in hints.iter().enumerate() {
@@ -1314,6 +1624,90 @@ impl App {
             spans.push(Span::raw(format!(" {label}")));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The settings screen: a text field per storage directory plus any
+    /// toggles. Adding a media type changes [`ConfigField`], not this layout.
+    fn render_config(&self, f: &mut Frame, area: Rect) {
+        let mut constraints = vec![Constraint::Length(3)];
+        constraints.extend(ConfigField::ALL.iter().map(|_| Constraint::Length(3)));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Min(0));
+        let rows = Layout::vertical(constraints).split(area);
+
+        let intro = if self.config_onboarding {
+            "Welcome! Choose where packrat writes your media (press s to change later)."
+        } else {
+            "Where packrat writes files, one directory per media type."
+        };
+        f.render_widget(
+            Paragraph::new(intro)
+                .block(Block::default().borders(Borders::ALL).title(" Settings "))
+                .wrap(Wrap { trim: true }),
+            rows[0],
+        );
+
+        for (i, &field) in ConfigField::ALL.iter().enumerate() {
+            let row = rows[i + 1];
+            let focused = self.config_focus == field;
+            let border = if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if field.is_toggle() {
+                let check = if self.auto_eject { "[x]" } else { "[ ]" };
+                let line = Line::from(vec![
+                    Span::styled(format!(" {check} "), Style::default().fg(Color::Cyan)),
+                    Span::raw(field.hint()),
+                    Span::styled("   Space to toggle", Style::default().fg(Color::DarkGray)),
+                ]);
+                f.render_widget(
+                    Paragraph::new(line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border)
+                            .title(field.title()),
+                    ),
+                    row,
+                );
+            } else {
+                f.render_widget(
+                    self.field(
+                        field.title(),
+                        self.config_input(field),
+                        focused,
+                        field.hint(),
+                    ),
+                    row,
+                );
+                if focused {
+                    set_cursor(f, row, self.config_input(field));
+                }
+            }
+        }
+
+        let mut footer = Vec::new();
+        if let Some(path) = config::config_path() {
+            footer.push(Span::styled(
+                " Saved to ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            footer.push(Span::styled(
+                path.display().to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(note) = &self.config_note {
+            footer.push(Span::styled(
+                format!("   {note}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true }),
+            rows[ConfigField::ALL.len() + 1],
+        );
     }
 
     fn render_detect(&self, f: &mut Frame, area: Rect) {
@@ -1402,8 +1796,6 @@ impl App {
             // Disc, looks-like, parsed and TVmaze lines inside a bordered block.
             Constraint::Length(6),
             Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Min(5),
         ])
@@ -1439,48 +1831,17 @@ impl App {
             set_cursor(f, fields[1], &self.season_input);
         }
 
-        f.render_widget(
-            self.field(
-                " TV directory ",
-                &self.tv_input,
-                self.focus == Field::TvDir,
-                "optional — the folder that holds show folders",
-            ),
-            rows[2],
-        );
-        if self.focus == Field::TvDir {
-            set_cursor(f, rows[2], &self.tv_input);
-        }
-        f.render_widget(
-            self.field(
-                " Movie directory ",
-                &self.movie_input,
-                self.focus == Field::MovieDir,
-                "optional — the folder that holds movie folders",
-            ),
-            rows[3],
-        );
-        if self.focus == Field::MovieDir {
-            set_cursor(f, rows[3], &self.movie_input);
-        }
-
         let checkbox = if self.include_extras { "[x]" } else { "[ ]" };
-        let mut extras = vec![
+        let extras = vec![
             Span::styled(format!(" {checkbox} "), Style::default().fg(Color::Cyan)),
             Span::raw("Include extras (trailers and featurettes)"),
             Span::styled("   e to toggle", Style::default().fg(Color::DarkGray)),
         ];
-        if let Some(note) = &self.config_note {
-            extras.push(Span::styled(
-                format!("   {note}"),
-                Style::default().fg(Color::Green),
-            ));
-        }
-        f.render_widget(Paragraph::new(Line::from(extras)), rows[4]);
+        f.render_widget(Paragraph::new(Line::from(extras)), rows[2]);
 
         let selected = self.jobs.iter().filter(|j| j.enabled).count();
         let title = format!(" Files — {selected} of {} selected ", self.jobs.len());
-        self.render_job_list(f, rows[5], title, Some(self.job_cursor), true);
+        self.render_job_list(f, rows[3], title, Some(self.job_cursor), true);
     }
 
     /// A bordered text field, brightening when focused.
@@ -1726,7 +2087,7 @@ impl App {
     }
 
     fn render_done(&self, f: &mut Frame, area: Rect) {
-        let rows = Layout::vertical([Constraint::Length(5), Constraint::Min(5)]).split(area);
+        let rows = Layout::vertical([Constraint::Length(6), Constraint::Min(5)]).split(area);
 
         let (headline, color) = if self.cancelled {
             (
@@ -1753,8 +2114,18 @@ impl App {
                 Style::default().fg(Color::Yellow),
             )));
         }
+        if let Some(note) = &self.eject_note {
+            lines.push(Line::from(Span::styled(
+                note.clone(),
+                Style::default().fg(if self.ejected {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            )));
+        }
         lines.push(Line::from(Span::styled(
-            "Press c to configure another disc, or Enter to quit.",
+            "Press c to configure another, x to eject, or Enter to quit.",
             Style::default().fg(Color::DarkGray),
         )));
         f.render_widget(
@@ -1841,7 +2212,7 @@ impl App {
     }
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
-        let popup = centered(area, 62, 18);
+        let popup = centered(area, 62, 20);
         f.render_widget(Clear, popup);
         let lines = vec![
             Line::from(Span::styled(
@@ -1851,11 +2222,13 @@ impl App {
             Line::raw(""),
             Line::from("Tab / Shift+Tab   move between fields or the drive list"),
             Line::from("↑ / ↓             select a drive or file"),
-            Line::from("Space             include / skip a file"),
+            Line::from("Space             include / skip a file · toggle a setting"),
             Line::from("a                 include / skip all (plan) · abort now (ripping)"),
             Line::from("e                 include extras"),
+            Line::from("s                 open settings"),
+            Line::from("x                 eject the disc · eject & configure (done)"),
             Line::from("d                 change drive"),
-            Line::from("Enter             load a drive · apply the plan"),
+            Line::from("Enter             load a drive · apply the plan · save settings"),
             Line::from("r                 rescan drives · start backing up"),
             Line::from("q / Esc           quit (while ripping: stop after this file)"),
             Line::from("Ctrl+C            stop now and quit"),
@@ -1996,8 +2369,12 @@ fn spawn_rip(
     source: DiscSource,
     disc: DiscModel,
     jobs: Vec<RipJob>,
+    device: Option<PathBuf>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        // Hold the tray shut for the whole run so an accidental eject cannot
+        // interrupt a read. A failed lock is not fatal.
+        let _tray = device.as_deref().map(packrat_core::drives::lock_tray);
         for job in jobs {
             // `cancel` stops between files; `abort` also stops the file that
             // is in progress.
@@ -2813,6 +3190,8 @@ mod tests {
     #[test]
     fn picker_falls_back_to_the_first_ready_disc() {
         let mut app = App::initial();
+        // Ignore whatever drive the machine that runs the tests last used.
+        app.last_device = None;
 
         app.set_drives(vec![
             drive("/dev/sr0", false, None),
@@ -3010,5 +3389,243 @@ mod tests {
         // Ripping hauls the pack; Done holds the cheese.
         assert_eq!(frame_width(&RAT_PACK_BLINK), frame_width(&RAT_PACK));
         assert_eq!(frame_width(&RAT_CHEESE_BLINK), frame_width(&RAT_CHEESE));
+    }
+
+    /// Render the whole UI and flatten it into one string.
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn config_fields_tab_in_a_cycle() {
+        assert_eq!(ConfigField::TvDir.next(), ConfigField::MovieDir);
+        assert_eq!(ConfigField::MovieDir.next(), ConfigField::AutoEject);
+        assert_eq!(ConfigField::AutoEject.next(), ConfigField::TvDir);
+        assert_eq!(ConfigField::TvDir.prev(), ConfigField::AutoEject);
+        assert_eq!(ConfigField::AutoEject.prev(), ConfigField::MovieDir);
+        assert_eq!(ConfigField::MovieDir.prev(), ConfigField::TvDir);
+    }
+
+    #[test]
+    fn onboarding_opens_the_config_screen_before_scanning() {
+        let mut app = App::initial();
+        app.start_onboarding();
+
+        assert_eq!(app.stage, Stage::Config);
+        assert!(app.config_onboarding);
+        assert_eq!(app.config_return, Stage::Detect);
+        assert!(
+            !app.scan_in_flight,
+            "onboarding should not start a drive scan"
+        );
+    }
+
+    #[test]
+    fn open_config_remembers_where_to_return() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.open_config();
+
+        assert_eq!(app.stage, Stage::Config);
+        assert_eq!(app.config_return, Stage::Plan);
+        assert!(!app.config_onboarding);
+    }
+
+    #[test]
+    fn closing_settings_returns_to_the_plan() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.open_config();
+
+        app.close_config();
+
+        assert_eq!(app.stage, Stage::Plan);
+    }
+
+    #[test]
+    fn escaping_settings_discards_unsaved_edits() {
+        let saved = display_path(Config::load().tv_dir.as_deref());
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.open_config();
+        app.tv_input = TextInput::from("/tmp/unsaved");
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert_eq!(app.tv_input.as_str(), saved);
+    }
+
+    #[test]
+    fn settings_key_opens_the_config_screen_from_the_plan() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.focus = Field::Jobs;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(app.stage, Stage::Config);
+        assert_eq!(app.config_return, Stage::Plan);
+    }
+
+    #[test]
+    fn s_types_into_the_show_field_instead_of_opening_settings() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.focus = Field::Show;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert_eq!(app.show_input.as_str(), "s");
+    }
+
+    #[test]
+    fn config_screen_renders_each_directory_field() {
+        let mut app = App::initial();
+        app.start_onboarding();
+        app.tv_input = TextInput::from("/mnt/media/tv");
+        app.movie_input = TextInput::from("/mnt/media/movies");
+
+        let screen = screen(&mut app, 100, 20);
+
+        assert!(screen.contains("Settings"), "{screen}");
+        assert!(screen.contains("TV directory"), "{screen}");
+        assert!(screen.contains("Movie directory"), "{screen}");
+        assert!(screen.contains("/mnt/media/tv"), "{screen}");
+        assert!(screen.contains("/mnt/media/movies"), "{screen}");
+    }
+
+    #[test]
+    fn config_screen_renders_the_auto_eject_toggle() {
+        let mut app = App::initial();
+        app.start_onboarding();
+        app.config_focus = ConfigField::AutoEject;
+        app.auto_eject = true;
+
+        let screen = screen(&mut app, 100, 24);
+
+        assert!(screen.contains("Eject when done"), "{screen}");
+        assert!(screen.contains("[x]"), "{screen}");
+        assert!(screen.contains("once a rip finishes"), "{screen}");
+    }
+
+    #[test]
+    fn space_toggles_auto_eject_on_the_config_screen() {
+        let mut app = App::initial();
+        app.start_onboarding();
+        app.config_focus = ConfigField::AutoEject;
+        let before = app.auto_eject;
+
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert_eq!(app.auto_eject, !before);
+    }
+
+    #[test]
+    fn x_ejects_from_the_plan_without_a_drive() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.focus = Field::Jobs;
+        app.device = None;
+        app.meta_note = None;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert!(
+            app.meta_note.is_some(),
+            "the user is told there is no drive"
+        );
+    }
+
+    #[test]
+    fn x_types_into_the_show_field_instead_of_ejecting() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.focus = Field::Show;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert_eq!(app.show_input.as_str(), "x");
+    }
+
+    #[test]
+    fn successful_eject_returns_to_the_picker_when_asked() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.device = Some(PathBuf::from("/dev/sr0"));
+        app.eject_then_picker = true;
+
+        app.handle_eject_done(Ok(()));
+
+        assert_eq!(app.stage, Stage::Detect);
+        assert!(app.disc.is_none());
+    }
+
+    #[test]
+    fn successful_auto_eject_stays_on_the_result_screen() {
+        let mut app = App::initial();
+        app.stage = Stage::Done;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.device = Some(PathBuf::from("/dev/sr0"));
+        app.eject_then_picker = false;
+
+        app.handle_eject_done(Ok(()));
+
+        assert!(app.ejected);
+        assert_eq!(app.stage, Stage::Done, "auto-eject keeps the results up");
+        assert_eq!(app.eject_note.as_deref(), Some("Disc ejected"));
+    }
+
+    #[test]
+    fn ejected_result_screen_falls_back_to_the_picker() {
+        let mut app = App::initial();
+        app.stage = Stage::Done;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.ejected = true;
+
+        app.back_to_plan();
+
+        assert_eq!(app.stage, Stage::Detect);
+        assert!(!app.ejected);
+    }
+
+    #[test]
+    fn failed_eject_keeps_the_screen_and_reports_it() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.eject_then_picker = true;
+
+        app.handle_eject_done(Err("no disc".into()));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert!(!app.ejected);
+        assert!(app.eject_note.as_deref().unwrap().contains("no disc"));
+        assert!(app.meta_note.as_deref().unwrap().contains("no disc"));
+    }
+
+    #[test]
+    fn plan_screen_no_longer_shows_directory_fields() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.classification = Some(kind(DiscKind::TvSeries));
+
+        let screen = screen(&mut app, 100, 20);
+
+        assert!(screen.contains("Show"), "{screen}");
+        assert!(!screen.contains("TV directory"), "{screen}");
+        assert!(!screen.contains("Movie directory"), "{screen}");
     }
 }

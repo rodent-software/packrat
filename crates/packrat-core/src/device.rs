@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use oxideav_dvd::udf::UdfVolume;
 use oxideav_dvd::{DvdDisc, DvdFileKind};
 
 use crate::error::DiscError;
@@ -39,23 +40,15 @@ impl DeviceChainReader {
     /// Open `device` and find the start of `VTS_xx_1.VOB`, the origin for the
     /// cell-relative sectors in the IFO.
     ///
-    /// The ISO 9660 bridge is used rather than UDF because ISO directory
-    /// records carry absolute disc LBAs, whereas UDF addresses are relative to
-    /// the partition (which does not start at sector 0 on real discs).
+    /// UDF (the DVD-mandated filesystem) is tried first because some
+    /// copy-protection schemes deliberately damage the ISO 9660 bridge — the
+    /// directory records a ripper would use to find the VOBs — while leaving
+    /// UDF intact so ordinary players still work. UDF block addresses are
+    /// relative to the partition, so the partition start is added to get an
+    /// absolute LBA. The ISO 9660 bridge is the fallback; its directory records
+    /// carry absolute disc LBAs already.
     pub fn open(device: &Path, vts_number: u8) -> Result<Self, DiscError> {
-        let file = File::open(device).map_err(|source| DiscError::Io {
-            path: device.to_path_buf(),
-            source,
-        })?;
-        let disc = DvdDisc::from_iso9660(file)
-            .map_err(|e| DiscError::Remux(format!("reading ISO 9660 from device: {e}")))?;
-        let base_lba = disc
-            .video_ts_files
-            .iter()
-            .find(|f| matches!(f.kind, DvdFileKind::VtsTitle { ts, vob: 1 } if ts == vts_number))
-            .map(|f| u64::from(f.lba))
-            .ok_or_else(|| DiscError::Remux(format!("device has no VTS_{vts_number:02}_1.VOB")))?;
-
+        let base_lba = vts_chain_base_lba(device, vts_number)?;
         Ok(Self {
             backend: Backend::open(device)?,
             base_lba,
@@ -72,6 +65,46 @@ impl DeviceChainReader {
         }
         Ok(&self.cache)
     }
+}
+
+/// Absolute LBA of `VTS_xx_1.VOB` on `device`.
+///
+/// Prefers UDF and adds its partition offset, then falls back to the ISO 9660
+/// bridge. See [`DeviceChainReader::open`] for why UDF comes first.
+fn vts_chain_base_lba(device: &Path, vts_number: u8) -> Result<u64, DiscError> {
+    // UDF first: its block addresses are partition-relative, so add the
+    // partition start to turn them into absolute disc LBAs.
+    if let Ok(file) = File::open(device) {
+        if let Ok(mut udf) = UdfVolume::open(file) {
+            let partition_start = udf.partition_start_sector;
+            if let Ok(disc) = DvdDisc::from_udf(&mut udf) {
+                if let Some(lba) = absolute_vts_base(&disc, partition_start, vts_number) {
+                    return Ok(lba);
+                }
+            }
+        }
+    }
+
+    // Fall back to the ISO 9660 bridge, whose directory records already carry
+    // absolute disc LBAs.
+    let file = File::open(device).map_err(|source| DiscError::Io {
+        path: device.to_path_buf(),
+        source,
+    })?;
+    let disc = DvdDisc::from_iso9660(file)
+        .map_err(|e| DiscError::Remux(format!("reading ISO 9660 from device: {e}")))?;
+    absolute_vts_base(&disc, 0, vts_number)
+        .ok_or_else(|| DiscError::Remux(format!("device has no VTS_{vts_number:02}_1.VOB")))
+}
+
+/// Absolute LBA of the first `VTS_xx_1.VOB` in `disc`, whose file LBAs are
+/// relative to a partition starting at `partition_start` (0 for ISO 9660,
+/// whose records are already absolute).
+fn absolute_vts_base(disc: &DvdDisc, partition_start: u64, vts_number: u8) -> Option<u64> {
+    disc.video_ts_files
+        .iter()
+        .find(|f| matches!(f.kind, DvdFileKind::VtsTitle { ts, vob: 1 } if ts == vts_number))
+        .map(|f| partition_start + u64::from(f.lba))
 }
 
 impl Backend {
@@ -141,5 +174,53 @@ impl Seek for DeviceChainReader {
         }
         self.pos = target as u64;
         Ok(self.pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_dvd::DvdFile;
+
+    fn disc_with(files: Vec<DvdFile>) -> DvdDisc {
+        DvdDisc {
+            volume_id: "TEST".into(),
+            title_set_count: 9,
+            video_ts_files: files,
+            audio_ts_files: Vec::new(),
+        }
+    }
+
+    fn vob(ts: u8, vob: u8, lba: u32) -> DvdFile {
+        DvdFile {
+            kind: DvdFileKind::VtsTitle { ts, vob },
+            name: format!("VTS_{ts:02}_{vob}.VOB"),
+            lba,
+            size: 1024 * 1024,
+            title_set: ts,
+            vob_index: vob,
+        }
+    }
+
+    /// UDF file LBAs are partition-relative, so the partition start is added.
+    #[test]
+    fn udf_base_lba_includes_the_partition_offset() {
+        let disc = disc_with(vec![vob(4, 1, 1000)]);
+        assert_eq!(absolute_vts_base(&disc, 262, 4), Some(1262));
+    }
+
+    /// ISO 9660 directory records are already absolute, so no offset is added.
+    #[test]
+    fn iso_base_lba_is_used_as_is() {
+        let disc = disc_with(vec![vob(4, 1, 1000)]);
+        assert_eq!(absolute_vts_base(&disc, 0, 4), Some(1000));
+    }
+
+    /// The origin is the first VOB of the requested title set, not another one.
+    #[test]
+    fn base_lba_selects_vob_one_of_the_title_set() {
+        let disc = disc_with(vec![vob(3, 1, 10), vob(4, 2, 20), vob(4, 1, 30)]);
+        assert_eq!(absolute_vts_base(&disc, 262, 4), Some(292));
+        assert_eq!(absolute_vts_base(&disc, 262, 5), None);
     }
 }

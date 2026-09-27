@@ -25,15 +25,21 @@ use ratatui::{DefaultTerminal, Frame};
 use packrat_core::{
     classify, display_name, feature_titles, movie_extra_file_in, movie_extras, movie_file_in,
     parse_label, preferred_titles, read_disc, read_vts, remux_chain_with_progress_and_cancel,
-    split_title, Classification, DiscError, DiscKind, DiscModel, DiscSource, LabelInfo, Movie,
-    OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show, Title, EXTRA_MIN, MIN_CONTENT,
+    split_title, Classification, DiscError, DiscKind, DiscModel, DiscSource, LabelInfo,
+    LibraryStats, Movie, OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show, Title,
+    EXTRA_MIN, MIN_CONTENT,
 };
 
 use crate::config::{self, Config};
+use crate::history::{self, History};
 use crate::{resolve_movie_naming, resolve_naming, MovieNaming, Naming};
 
 /// Spinner frames used while a background task runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How often the header rotates to the next collection stat, in loop ticks.
+/// The event loop wakes ten times a second, so this is about twelve seconds.
+const STATS_ROTATE_TICKS: usize = 120;
 
 /// Kaomoji frames for the header mouse. `RAT_IDLE` is the base pose; the
 /// others blink, flick an ear, sniff, or carry a load. The tail stays put —
@@ -378,6 +384,11 @@ enum WorkerEvent {
     EjectDone {
         result: Result<(), String>,
     },
+    /// A refreshed collection summary from the background scan.
+    LibraryStats {
+        library: LibraryStats,
+        free_bytes: Option<u64>,
+    },
 }
 
 /// The latest progress from the file currently being ripped.
@@ -483,6 +494,18 @@ struct App {
     failed: usize,
     cancelled: bool,
     current: Option<ProgressSnapshot>,
+    /// Files written and payload bytes for the rip in progress, folded into
+    /// `history` when it finishes.
+    session_files: u64,
+    session_bytes: u64,
+
+    // Collection summary for the header
+    library: LibraryStats,
+    history: History,
+    /// Free bytes on the destination volume, when it could be read.
+    free_bytes: Option<u64>,
+    /// A scan is in flight, so a second request waits rather than piling on.
+    stats_in_flight: bool,
 
     show_help: bool,
     should_quit: bool,
@@ -492,6 +515,7 @@ impl App {
     fn new(shutdown: Arc<AtomicBool>) -> Self {
         let mut app = Self::initial();
         app.shutdown = shutdown;
+        app.refresh_stats();
         if config::exists() {
             app.begin_detection(true);
         } else {
@@ -563,6 +587,12 @@ impl App {
             failed: 0,
             cancelled: false,
             current: None,
+            session_files: 0,
+            session_bytes: 0,
+            library: LibraryStats::default(),
+            history: History::load(),
+            free_bytes: None,
+            stats_in_flight: false,
             show_help: false,
             should_quit: false,
         }
@@ -587,6 +617,33 @@ impl App {
         self.scan_in_flight = true;
         self.detect_loading = false;
         list_drives(self.tx.clone());
+    }
+
+    /// Rescan the library in the background for the header summary. A request
+    /// already in flight is left to finish, so a burst of changes only scans
+    /// once.
+    fn refresh_stats(&mut self) {
+        if self.stats_in_flight {
+            return;
+        }
+        self.stats_in_flight = true;
+        scan_stats(self.tx.clone(), self.tv_path(), self.movie_path());
+    }
+
+    /// Fold the finished rip into the persisted history and refresh the
+    /// collection totals so the header reflects the files just written.
+    fn record_backup(&mut self) {
+        let files = self.session_files;
+        let bytes = self.session_bytes;
+        self.session_files = 0;
+        self.session_bytes = 0;
+        if files > 0 {
+            self.history.record(files, bytes, history::unix_now());
+            if let Err(e) = self.history.save() {
+                self.meta_note = Some(format!("Could not save backup history: {e:#}"));
+            }
+        }
+        self.refresh_stats();
     }
 
     /// Load the disc in the highlighted drive.
@@ -909,7 +966,10 @@ impl App {
             KeyCode::Tab => self.config_focus = self.config_focus.next(),
             KeyCode::BackTab => self.config_focus = self.config_focus.prev(),
             KeyCode::Enter => match self.persist_config() {
-                Ok(_) => self.close_config(),
+                Ok(_) => {
+                    self.close_config();
+                    self.refresh_stats();
+                }
                 Err(e) => self.config_note = Some(format!("Could not save settings: {e}")),
             },
             KeyCode::Esc => {
@@ -1322,6 +1382,8 @@ impl App {
         self.failed = 0;
         self.cancelled = false;
         self.current = None;
+        self.session_files = 0;
+        self.session_bytes = 0;
         self.ejected = false;
         self.eject_then_picker = false;
         self.eject_note = None;
@@ -1548,6 +1610,9 @@ impl App {
                 match result {
                     Ok(report) => {
                         self.done += 1;
+                        self.session_files = self.session_files.saturating_add(1);
+                        self.session_bytes =
+                            self.session_bytes.saturating_add(report.payload_bytes);
                         if let Some(job) = self.jobs.get_mut(index) {
                             job.status = JobStatus::Done(report);
                         }
@@ -1576,12 +1641,23 @@ impl App {
                 // `.partial` file is gone before the result screen appears.
                 // That also releases the tray lock before an auto-eject.
                 self.finish_rip();
+                // A cancelled run may still have written some files;
+                // `record_backup` records only those that finished.
+                self.record_backup();
                 if self.auto_eject && self.device.is_some() && !cancelled && self.failed == 0 {
                     self.eject_loaded_disc(false);
                 }
             }
             WorkerEvent::EjectDone { result } => {
                 self.handle_eject_done(result);
+            }
+            WorkerEvent::LibraryStats {
+                library,
+                free_bytes,
+            } => {
+                self.stats_in_flight = false;
+                self.library = library;
+                self.free_bytes = free_bytes;
             }
         }
     }
@@ -1682,6 +1758,59 @@ impl App {
         }
     }
 
+    /// Rotation-friendly collection lines for the header. Each entry is one
+    /// "page"; the caller shows as many as fit and rotates through the rest.
+    fn stat_pages(&self) -> Vec<Line<'static>> {
+        let mut pages = Vec::new();
+        let library = &self.library;
+        if !library.is_empty() {
+            pages.push(stat_line(
+                "Library",
+                format!(
+                    "{} · {} · {} · {}",
+                    count(library.shows, "show", "shows"),
+                    count(library.seasons, "season", "seasons"),
+                    count(library.episodes, "episode", "episodes"),
+                    count(library.movies, "movie", "movies"),
+                ),
+            ));
+        }
+        if library.total_bytes() > 0 || self.free_bytes.is_some() {
+            let mut parts = Vec::new();
+            if library.total_bytes() > 0 {
+                parts.push(format!("{} backed up", fmt_bytes(library.total_bytes())));
+            }
+            if let Some(free) = self.free_bytes {
+                parts.push(format!("{} free", fmt_bytes(free)));
+            }
+            pages.push(stat_line("Storage", parts.join(" · ")));
+        }
+        if self.history.discs > 0 {
+            pages.push(stat_line(
+                "History",
+                format!(
+                    "{} · {} written",
+                    count(self.history.discs, "disc", "discs"),
+                    fmt_bytes(self.history.bytes),
+                ),
+            ));
+        }
+        pages
+    }
+
+    /// A rotating window over the stat pages that fits in `rows` lines. With
+    /// more pages than rows the window advances every [`STATS_ROTATE_TICKS`].
+    fn header_stats(&self, rows: usize) -> Vec<Line<'static>> {
+        let pages = self.stat_pages();
+        if pages.is_empty() || rows == 0 {
+            return Vec::new();
+        }
+        let start = (self.tick / STATS_ROTATE_TICKS) % pages.len();
+        (0..rows.min(pages.len()))
+            .map(|i| pages[(start + i) % pages.len()].clone())
+            .collect()
+    }
+
     fn render_header(&self, f: &mut Frame, area: Rect) {
         let where_ = match self.stage {
             Stage::Config => "settings",
@@ -1711,8 +1840,11 @@ impl App {
             }
             let cols =
                 Layout::horizontal([Constraint::Min(1), Constraint::Length(rat_width)]).split(area);
-            // Top-align the title with the first row of the three-row mouse.
-            f.render_widget(Paragraph::new(badge), cols[0]);
+            // Top-align the title with the first row of the three-row mouse;
+            // the collection summary fills the rows beneath it.
+            let mut lines = vec![badge];
+            lines.extend(self.header_stats(usize::from(area.height).saturating_sub(1)));
+            f.render_widget(Paragraph::new(lines), cols[0]);
             f.render_widget(
                 Paragraph::new(rat_lines(frame)).alignment(Alignment::Right),
                 cols[1],
@@ -2577,6 +2709,27 @@ fn list_drives(tx: Sender<WorkerEvent>) {
     });
 }
 
+/// Summarise the configured destinations for the header, reporting the free
+/// space of whichever destination exists. Runs off the UI thread because the
+/// walk touches every folder in the library.
+fn scan_stats(tx: Sender<WorkerEvent>, tv_dir: Option<PathBuf>, movie_dir: Option<PathBuf>) {
+    std::thread::spawn(move || {
+        let library = packrat_core::stats::scan(tv_dir.as_deref(), movie_dir.as_deref());
+        let probe = tv_dir
+            .as_deref()
+            .filter(|path| path.is_dir())
+            .or_else(|| movie_dir.as_deref().filter(|path| path.is_dir()))
+            .map(Path::to_path_buf);
+        let free_bytes = probe
+            .as_deref()
+            .and_then(|path| fs4::available_space(path).ok());
+        let _ = tx.send(WorkerEvent::LibraryStats {
+            library,
+            free_bytes,
+        });
+    });
+}
+
 /// Read a drive's disc and report it back to the UI.
 fn load_drive_inner(tx: Sender<WorkerEvent>, drive: OpticalDrive) {
     let Some(mount) = drive.mount.clone() else {
@@ -2941,6 +3094,38 @@ fn fmt_eta(duration: Duration) -> String {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+/// One collection stat line, with its label dimmed so it stays in the
+/// background next to the stage badge.
+fn stat_line(label: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray)),
+        Span::raw(value),
+    ])
+}
+
+/// `1 show`, `2 shows`: the count with the right noun.
+fn count(n: u64, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
+/// Human-readable decimal size, e.g. `18.4 GB`.
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -4001,5 +4186,115 @@ mod tests {
 
         assert!(screen.contains("First episode"), "{screen}");
         assert!(screen.contains("e.g. 29"), "{screen}");
+    }
+
+    /// Flatten a stat page into plain text for assertions.
+    fn lines_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn formats_collection_sizes() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(999), "999 B");
+        assert_eq!(fmt_bytes(1_000), "1.0 KB");
+        assert_eq!(fmt_bytes(1_500_000), "1.5 MB");
+        assert_eq!(fmt_bytes(18_400_000_000), "18.4 GB");
+        assert_eq!(fmt_bytes(1_200_000_000_000), "1.2 TB");
+    }
+
+    #[test]
+    fn counts_use_the_right_noun() {
+        assert_eq!(count(1, "show", "shows"), "1 show");
+        assert_eq!(count(3, "show", "shows"), "3 shows");
+    }
+
+    #[test]
+    fn header_stats_are_quiet_until_there_is_a_library() {
+        let mut app = App::initial();
+        app.history = History::default();
+        assert!(app.stat_pages().is_empty());
+        assert!(app.header_stats(2).is_empty());
+    }
+
+    #[test]
+    fn header_stats_rotate_through_the_pages() {
+        let mut app = App::initial();
+        app.library = LibraryStats {
+            shows: 1,
+            seasons: 1,
+            episodes: 28,
+            movies: 1,
+            tv_bytes: 17_000_000_000,
+            movie_bytes: 1_400_000_000,
+            newest: None,
+        };
+        app.free_bytes = Some(47_000_000_000);
+        app.history = History {
+            discs: 3,
+            files: 41,
+            bytes: 18_000_000_000,
+            last_backup: Some(1),
+        };
+
+        assert_eq!(app.stat_pages().len(), 3);
+
+        // The window advances one page per rotation interval.
+        app.tick = 0;
+        let first = lines_text(&app.header_stats(2));
+        app.tick = STATS_ROTATE_TICKS;
+        let second = lines_text(&app.header_stats(2));
+        assert_ne!(first, second, "the header window should advance");
+        assert!(first.contains("Library"), "{first}");
+        assert!(first.contains("Storage"), "{first}");
+    }
+
+    #[test]
+    fn plan_header_renders_a_collection_stat() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.classification = Some(kind(DiscKind::TvSeries));
+        app.library = LibraryStats {
+            shows: 1,
+            seasons: 1,
+            episodes: 28,
+            movies: 1,
+            ..LibraryStats::default()
+        };
+        app.history = History::default();
+
+        let screen = screen(&mut app, 140, 20);
+
+        assert!(screen.contains("1 show"), "{screen}");
+    }
+
+    #[test]
+    fn job_done_tallies_the_rip_for_history() {
+        let mut app = App::initial();
+        let d = disc(vec![title(1, 5, 60)]);
+        app.jobs = vec![Job::new(&d.titles[0], 1, 5, PathBuf::from("/tmp/x.mkv"))];
+
+        app.on_worker(WorkerEvent::JobDone {
+            index: 0,
+            result: Ok(RemuxReport {
+                packets: 10,
+                payload_bytes: 1_234,
+                chapters: 5,
+            }),
+        });
+
+        assert_eq!(app.done, 1);
+        assert_eq!(app.session_files, 1);
+        assert_eq!(app.session_bytes, 1_234);
     }
 }

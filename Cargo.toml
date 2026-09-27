@@ -19,6 +19,8 @@ strsim = "0.11"
 ureq = { version = "3", features = ["json"] }
 ratatui = "0.29"
 signal-hook = "0.3"
+# Cross-platform free/total space on the destination volume.
+fs4 = { version = "1", features = ["sync"] }
 
 # Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
 oxideav-dvd = "0.0.4"

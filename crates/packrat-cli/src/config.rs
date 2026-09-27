@@ -149,7 +149,7 @@ pub fn exists() -> bool {
 }
 
 /// Platform configuration directory.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA").map(PathBuf::from)

@@ -17,6 +17,7 @@ pub mod meta;
 pub mod movie;
 pub mod remux;
 pub mod source;
+pub mod stats;
 pub mod tmdb;
 
 pub use detect::{
@@ -46,4 +47,5 @@ pub use remux::{
     remux_chapters_with_reader, remux_title, RemuxPhase, RemuxProgress, RemuxReport,
 };
 pub use source::DiscSource;
+pub use stats::{scan as scan_library, LibraryStats};
 pub use tmdb::{movie_details, search_movies, Movie};

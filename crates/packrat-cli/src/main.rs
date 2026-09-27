@@ -1,6 +1,7 @@
 //! `packrat` command-line entry point.
 
 mod config;
+mod history;
 mod tui;
 
 use std::collections::HashMap;

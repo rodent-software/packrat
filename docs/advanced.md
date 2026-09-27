@@ -71,6 +71,11 @@ Headless commands pick the saved values up automatically, so this is enough:
 packrat watch --include-extras
 ```
 
+The guide's header summarises the library it finds in those directories. Its
+all-time tally of discs, files and bytes written lives next to the preferences
+in `~/.config/packrat/history.toml`; deleting that file only resets the
+counters, not the library.
+
 `--library <root>` is shorthand for `--tv-dir <root>/TV Shows --movie-dir
 <root>/Movies`, for libraries laid out with Plex's conventional category
 folders. An explicit flag wins over `--library`, which wins over a saved

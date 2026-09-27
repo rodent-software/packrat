@@ -38,6 +38,11 @@ can:
   to eject automatically after a clean rip
 - press `Enter` to apply edits and `r` to rip
 
+The header carries a running summary of your collection: how many shows,
+seasons, episodes and movies are on disk, the storage backed up and free, and
+the all-time discs and bytes packrat has written. When there is more than fits
+it rotates through the stats every twelve seconds or so.
+
 Files are written straight into the configured directory with Plex's naming:
 
 ```text

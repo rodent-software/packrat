@@ -12,10 +12,11 @@ use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use packrat_core::{
-    alternates, classify, episode_file_in, episode_range_file_in, extra_file_in, match_episodes,
-    match_span, movie_file_in, parse_label, preferred_titles, read_disc, read_vts, remux_chain,
-    search_show, split_title, DiscKind, DiscModel, DiscSource, Episode, EpisodeMatch, EpisodeSpan,
-    OpticalDrive, Show, Title, EXTRA_MIN, MIN_CONTENT,
+    alternates, classify, display_name, episode_file_in, episode_range_file_in, extra_file_in,
+    feature_titles, match_episodes, match_span, movie_extra_file_in, movie_extras, movie_file_in,
+    parse_label, preferred_titles, read_disc, read_vts, remux_chain, resolve_movie, search_show,
+    split_title, DiscKind, DiscModel, DiscSource, Episode, EpisodeMatch, EpisodeSpan, Movie,
+    MovieQuery, OpticalDrive, Show, Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 #[derive(Parser)]
@@ -41,7 +42,9 @@ enum Command {
         path: PathBuf,
     },
     /// Classify a disc and propose how it should be ripped (read-only).
-    #[command(after_help = "Examples:\n  packrat plan /run/media/$USER/DRAGON_BALL_S1_D1")]
+    #[command(
+        after_help = "Examples:\n  packrat plan /run/media/$USER/DRAGON_BALL_S1_D1\n  packrat plan /run/media/$USER/THE_MATRIX_1999"
+    )]
     Plan {
         /// A mounted disc root, or its VIDEO_TS directory.
         path: PathBuf,
@@ -67,9 +70,10 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Split a TV disc's "Play All" titles into per-episode MKVs.
+    /// Split a disc into outputs: per-episode MKVs for a TV disc, or the main
+    /// feature and extras for a movie disc.
     #[command(
-        after_help = "Examples:\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --dry-run\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --tv-dir /mnt/dvd/media/tv\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --library /mnt/media\n  packrat split /run/media/$USER/DVD_LABEL --device /dev/sr0 --out-dir out --tv-dir /mnt/dvd/media/tv"
+        after_help = "Examples:\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --dry-run\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --tv-dir /mnt/dvd/media/tv\n  packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out --library /mnt/media\n  packrat split /run/media/$USER/THE_MATRIX_1999 --out-dir out --library /mnt/media --include-extras\n  packrat split /run/media/$USER/DVD_LABEL --device /dev/sr0 --out-dir out --tv-dir /mnt/dvd/media/tv"
     )]
     Split {
         /// A mounted disc root, or its VIDEO_TS directory.
@@ -93,8 +97,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Write Plex-named files under this library root (adds `TV Shows/`
-        /// and `Movies/`, and looks the disc up on TVmaze). Shorthand for
-        /// `--tv-dir <LIBRARY>/TV Shows --movie-dir <LIBRARY>/Movies`.
+        /// and `Movies/`, and looks the disc up on TVmaze or TMDb). Shorthand
+        /// for `--tv-dir <LIBRARY>/TV Shows --movie-dir <LIBRARY>/Movies`.
         #[arg(long)]
         library: Option<PathBuf>,
         /// Directory that holds show folders, such as an existing Plex TV
@@ -115,21 +119,33 @@ enum Command {
         /// Override the detected season number.
         #[arg(long)]
         season: Option<u16>,
+        /// Override the movie title used for metadata and naming.
+        #[arg(long)]
+        movie: Option<String>,
+        /// Override the detected release year (movies).
+        #[arg(long)]
+        year: Option<u16>,
     },
-    /// Match the disc against TVmaze and show the proposed Plex layout.
+    /// Match the disc against TVmaze (shows) or TMDb (movies) and show the
+    /// proposed Plex layout.
     #[command(
-        after_help = "Examples:\n  packrat identify /run/media/$USER/DRAGON_BALL_S1_D1 --library /mnt/media"
+        after_help = "Examples:\n  packrat identify /run/media/$USER/DRAGON_BALL_S1_D1 --library /mnt/media\n  packrat identify /run/media/$USER/THE_MATRIX_1999 --movie-dir /mnt/media/Movies"
     )]
     Identify {
         /// A mounted disc root, or its VIDEO_TS directory.
         path: PathBuf,
-        /// Library root used when printing proposed paths (adds `TV Shows/`).
+        /// Library root used when printing proposed paths (adds `TV Shows/`
+        /// and `Movies/`).
         #[arg(long)]
         library: Option<PathBuf>,
         /// Directory that holds show folders. Overrides `--library` and any
         /// saved preference.
         #[arg(long)]
         tv_dir: Option<PathBuf>,
+        /// Directory that holds movie folders. Overrides `--library` and any
+        /// saved preference.
+        #[arg(long)]
+        movie_dir: Option<PathBuf>,
     },
     /// List optical drives and any disc in them.
     #[command(after_help = "Examples:\n  packrat drives")]
@@ -196,6 +212,8 @@ fn main() -> Result<()> {
             device,
             show,
             season,
+            movie,
+            year,
         }) => {
             let dest =
                 resolve_destinations(library.as_deref(), tv_dir.as_deref(), movie_dir.as_deref());
@@ -211,14 +229,18 @@ fn main() -> Result<()> {
                 device.as_deref(),
                 show.as_deref(),
                 season,
+                movie.as_deref(),
+                year,
             )
         }
         Some(Command::Identify {
             path,
             library,
             tv_dir,
+            movie_dir,
         }) => {
-            let dest = resolve_destinations(library.as_deref(), tv_dir.as_deref(), None);
+            let dest =
+                resolve_destinations(library.as_deref(), tv_dir.as_deref(), movie_dir.as_deref());
             identify(&path, &dest)
         }
         Some(Command::Drives) => drives(),
@@ -334,6 +356,10 @@ fn plan(path: &PathBuf) -> Result<()> {
     }
     println!();
 
+    if classification.kind == DiscKind::Movie {
+        return plan_movie(&disc);
+    }
+
     let mut planned = 0usize;
     let preferred = preferred_titles(&disc);
     for title in disc
@@ -388,6 +414,73 @@ fn plan(path: &PathBuf) -> Result<()> {
 
     println!();
     println!("Planned outputs: {planned}");
+    Ok(())
+}
+
+/// The movie half of [`plan`]: the main feature, its extras and, when a TMDb
+/// key is configured, the metadata match.
+fn plan_movie(disc: &DiscModel) -> Result<()> {
+    let label = parse_label(&disc.volume_id);
+    let extras = movie_extras(disc);
+
+    let Some(feature) = feature_titles(disc).first().copied() else {
+        println!("No feature-length title found.");
+        return Ok(());
+    };
+    println!(
+        "Feature: title {} ({} chapters, {})",
+        feature.number,
+        feature.chapters,
+        fmt_duration(feature.duration)
+    );
+    println!(
+        "Extras : {} bonus title(s) (featurettes, trailers, second features)",
+        extras.len()
+    );
+    println!();
+
+    let Some(key) = Config::load().tmdb_key() else {
+        println!("(set a TMDb API key in settings to match this movie)");
+        println!();
+        println!("Planned outputs: 1 feature + {} extra(s)", extras.len());
+        return Ok(());
+    };
+
+    let query = MovieQuery::new(&label.title, label.year, feature.duration);
+    match resolve_movie(&key, &query) {
+        Ok(resolution) => {
+            if let Some(movie) = resolution.auto_accepted() {
+                println!(
+                    "Matched: {} ({})  [tmdb {}]",
+                    movie.title,
+                    movie
+                        .year()
+                        .map(|y| y.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    movie.id
+                );
+            } else if resolution.candidates.is_empty() {
+                println!("No TMDb match for '{}'.", label.title);
+            } else {
+                println!("No confident TMDb match for '{}'; candidates:", label.title);
+                for (score, candidate) in &resolution.candidates {
+                    println!(
+                        "  {:.0}%  {} ({})",
+                        score * 100.0,
+                        candidate.title,
+                        candidate
+                            .year()
+                            .map(|y| y.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    );
+                }
+            }
+        }
+        Err(e) => println!("TMDb lookup failed: {e}"),
+    }
+
+    println!();
+    println!("Planned outputs: 1 feature + {} extra(s)", extras.len());
     Ok(())
 }
 
@@ -498,6 +591,112 @@ pub(crate) struct Resolved {
     pub(crate) show: Option<Show>,
     pub(crate) naming: Option<Naming>,
     pub(crate) warning: Option<String>,
+}
+
+/// Metadata used to name movie outputs in a Plex library.
+#[derive(Clone)]
+pub(crate) struct MovieNaming {
+    movies_dir: PathBuf,
+    title: String,
+    year: Option<u16>,
+}
+
+impl MovieNaming {
+    pub(crate) fn feature_path(&self) -> PathBuf {
+        movie_file_in(&self.movies_dir, &self.title, self.year)
+    }
+
+    /// Path for a short title ripped as an extra under `<Title (Year)>/Other/`.
+    pub(crate) fn extra_path(&self, description: &str) -> PathBuf {
+        movie_extra_file_in(&self.movies_dir, &self.title, self.year, description)
+    }
+
+    /// Replace the title and year, e.g. after the user picks a TMDb candidate.
+    pub(crate) fn retitle(&mut self, title: String, year: Option<u16>) {
+        self.title = title;
+        self.year = year;
+    }
+}
+
+/// The outcome of a movie metadata lookup.
+pub(crate) struct ResolvedMovie {
+    pub(crate) naming: MovieNaming,
+    /// The auto-accepted TMDb match, when there was one.
+    pub(crate) movie: Option<Movie>,
+    /// Ranked candidates when the match was not confident enough to accept.
+    pub(crate) candidates: Vec<(f64, Movie)>,
+    pub(crate) warning: Option<String>,
+}
+
+/// Resolve TMDb metadata for a disc's main feature.
+///
+/// A missing key or a low-confidence match is reported through
+/// [`ResolvedMovie::warning`] and falls back to the disc label, so ripping
+/// never depends on the network. Without a key it makes no request at all.
+pub(crate) fn resolve_movie_naming(
+    movies_dir: &Path,
+    disc: &DiscModel,
+    feature: &Title,
+    title_override: Option<&str>,
+    year_override: Option<u16>,
+) -> Result<ResolvedMovie> {
+    let label = parse_label(&disc.volume_id);
+    let query_title = title_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(label.title.as_str());
+    let query_year = year_override.or(label.year);
+
+    let fallback = |warning: Option<String>| ResolvedMovie {
+        naming: MovieNaming {
+            movies_dir: movies_dir.to_path_buf(),
+            title: query_title.to_string(),
+            year: query_year,
+        },
+        movie: None,
+        candidates: Vec::new(),
+        warning,
+    };
+
+    let Some(key) = Config::load().tmdb_key() else {
+        return Ok(fallback(Some(
+            "no TMDb API key; naming the movie from the disc label".into(),
+        )));
+    };
+
+    let query = MovieQuery::new(query_title, query_year, feature.duration);
+    let resolution = match resolve_movie(&key, &query) {
+        Ok(resolution) => resolution,
+        // A key or network problem must not block the rip; fall back to the
+        // label and say why.
+        Err(e) => {
+            return Ok(fallback(Some(format!(
+                "TMDb lookup failed ({e}); naming the movie from the disc label"
+            ))));
+        }
+    };
+
+    if let Some(movie) = resolution.auto_accepted() {
+        return Ok(ResolvedMovie {
+            naming: MovieNaming {
+                movies_dir: movies_dir.to_path_buf(),
+                title: movie.title.clone(),
+                year: movie.year(),
+            },
+            movie: Some(movie.clone()),
+            candidates: resolution.candidates.clone(),
+            warning: None,
+        });
+    }
+
+    let warning = if resolution.candidates.is_empty() {
+        format!("no TMDb match for '{query_title}'; naming the movie from the disc label")
+    } else {
+        format!("no confident TMDb match for '{query_title}'; choose a candidate")
+    };
+    let mut resolved = fallback(Some(warning));
+    resolved.candidates = resolution.candidates;
+    Ok(resolved)
 }
 
 /// Resolve TVmaze metadata for the disc's preferred titles. A miss is reported
@@ -646,6 +845,8 @@ fn split(
     device: Option<&Path>,
     show: Option<&str>,
     season: Option<u16>,
+    movie: Option<&str>,
+    year: Option<u16>,
 ) -> Result<()> {
     let (source, disc) = open_with_device(path, device)?;
     let preferred = preferred_titles(&disc);
@@ -671,22 +872,59 @@ fn split(
 
     if is_movie {
         // A feature disc: rip the main feature and name it as a Plex movie.
-        if let Some(film) = disc
-            .content_titles(MIN_CONTENT)
-            .into_iter()
-            .max_by_key(|t| t.duration)
-        {
-            let label = parse_label(&disc.volume_id);
-            let path = match dest.movie.as_deref() {
-                Some(root) => movie_file_in(root, &label.title, label.year),
+        let label = parse_label(&disc.volume_id);
+        let feature = feature_titles(&disc).first().copied();
+        let extras = movie_extras(&disc);
+        if !include_extras && !extras.is_empty() {
+            eprintln!(
+                "note: {} extra title(s) available; pass --include-extras to rip them",
+                extras.len()
+            );
+        }
+
+        // Metadata is only consulted when a movie directory is configured;
+        // without one, files are named from the label exactly as before.
+        let resolved = match (dest.movie.as_deref(), feature) {
+            (Some(dir), Some(feature)) => {
+                Some(resolve_movie_naming(dir, &disc, feature, movie, year)?)
+            }
+            _ => None,
+        };
+        if let Some(warning) = resolved.as_ref().and_then(|r| r.warning.as_deref()) {
+            eprintln!("warning: {warning}");
+        }
+
+        if let Some(feature) = feature {
+            let path = match &resolved {
+                Some(r) => r.naming.feature_path(),
                 None => out_dir.join(format!("{}.mkv", label.title)),
             };
             jobs.push(Job {
-                title: film.number,
+                title: feature.number,
                 first: 1,
-                last: film.chapters,
+                last: feature.chapters,
                 path,
             });
+        }
+
+        if include_extras {
+            for title in &extras {
+                let description = format!("Title {:02}", title.number);
+                let path = match &resolved {
+                    Some(r) => r.naming.extra_path(&description),
+                    None => out_dir.join(format!(
+                        "{} - {}.mkv",
+                        display_name(&label.title, label.year),
+                        description
+                    )),
+                };
+                jobs.push(Job {
+                    title: title.number,
+                    first: 1,
+                    last: title.chapters,
+                    path,
+                });
+            }
         }
     } else {
         for title in disc.titles.iter().filter(|t| match only_title {
@@ -793,11 +1031,18 @@ fn split(
 }
 
 fn identify(path: &PathBuf, dest: &Destinations) -> Result<()> {
+    let (_, disc) = open(path)?;
+    match classify(&disc).kind {
+        DiscKind::Movie => identify_movie(&disc, dest),
+        _ => identify_tv(&disc, dest),
+    }
+}
+
+fn identify_tv(disc: &DiscModel, dest: &Destinations) -> Result<()> {
     let tv_dir = dest
         .tv
         .clone()
         .unwrap_or_else(|| PathBuf::from(".").join("TV Shows"));
-    let (_, disc) = open(path)?;
     let label = parse_label(&disc.volume_id);
 
     println!("Disc label : {}", disc.volume_id);
@@ -829,8 +1074,8 @@ fn identify(path: &PathBuf, dest: &Destinations) -> Result<()> {
     );
 
     let episodes = packrat_core::meta::episodes(show.id).context("fetching episodes")?;
-    let preferred = preferred_titles(&disc);
-    let hints = disc_episode_hints(&episodes, season, &disc, &preferred, label.disc);
+    let preferred = preferred_titles(disc);
+    let hints = disc_episode_hints(&episodes, season, disc, &preferred, label.disc);
 
     for number in preferred {
         let Some(title) = disc.titles.iter().find(|t| t.number == number) else {
@@ -861,6 +1106,76 @@ fn identify(path: &PathBuf, dest: &Destinations) -> Result<()> {
                 out.display()
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Preview how a movie disc would be named, matching TMDb when a key is set.
+fn identify_movie(disc: &DiscModel, dest: &Destinations) -> Result<()> {
+    let label = parse_label(&disc.volume_id);
+    let movies_dir = dest
+        .movie
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".").join("Movies"));
+
+    println!("Disc label : {}", disc.volume_id);
+    println!(
+        "Parsed     : '{}'{}",
+        label.title,
+        label.year.map(|y| format!(" ({y})")).unwrap_or_default()
+    );
+    println!("Looks like : a movie");
+
+    let Some(feature) = feature_titles(disc).first().copied() else {
+        println!("No feature-length title found.");
+        return Ok(());
+    };
+    println!(
+        "Feature    : title {} ({} chapters, {})",
+        feature.number,
+        feature.chapters,
+        fmt_duration(feature.duration)
+    );
+
+    let resolved = resolve_movie_naming(&movies_dir, disc, feature, None, None)?;
+    match (&resolved.movie, &resolved.warning) {
+        (Some(movie), _) => println!(
+            "Matched    : {} ({})  [tmdb {}]",
+            movie.title,
+            movie
+                .year()
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "?".into()),
+            movie.id
+        ),
+        (None, Some(warning)) => {
+            println!("Metadata   : {warning}");
+            for (score, candidate) in &resolved.candidates {
+                println!(
+                    "  {:.0}%  {} ({})  [tmdb {}]",
+                    score * 100.0,
+                    candidate.title,
+                    candidate
+                        .year()
+                        .map(|y| y.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    candidate.id
+                );
+            }
+        }
+        (None, None) => {}
+    }
+
+    println!("\nProposed   :");
+    println!("  {}", resolved.naming.feature_path().display());
+    for title in movie_extras(disc) {
+        let description = format!("Title {:02}", title.number);
+        println!(
+            "  {}   ({})",
+            resolved.naming.extra_path(&description).display(),
+            fmt_duration(title.duration)
+        );
     }
 
     Ok(())
@@ -966,6 +1281,8 @@ fn watch(
                         dry_run,
                         dest,
                         Some(&drive.device),
+                        None,
+                        None,
                         None,
                         None,
                     )?;

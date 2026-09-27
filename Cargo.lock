@@ -718,6 +718,7 @@ dependencies = [
  "oxideav-mkv",
  "serde",
  "serde_json",
+ "strsim",
  "thiserror",
  "ureq",
 ]

@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use crate::disc::{DiscModel, Title};
+use crate::identify::parse_label;
 
 /// Titles shorter than this are menus/warnings/previews, not content.
 pub const MIN_CONTENT: Duration = Duration::from_secs(5 * 60);
@@ -53,7 +54,12 @@ pub struct ChapterPattern {
     pub offset: usize,
 }
 
-/// Classify a disc from title durations and chapter structure.
+/// Classify a disc from title durations, chapter structure and the volume
+/// label.
+///
+/// The label matters: a disc explicitly labelled as a season is television
+/// even when its individual titles are feature length, while a release year
+/// and no season marker is corroboration for a movie.
 pub fn classify(disc: &DiscModel) -> Classification {
     let content = disc.content_titles(MIN_CONTENT);
     if content.is_empty() {
@@ -63,6 +69,10 @@ pub fn classify(disc: &DiscModel) -> Classification {
             reasons: vec!["no title is long enough to be content".into()],
         };
     }
+
+    let label = parse_label(&disc.volume_id);
+    let season_label = label.season.is_some();
+    let year_label = label.year.is_some();
 
     let longest = content
         .iter()
@@ -76,11 +86,13 @@ pub fn classify(disc: &DiscModel) -> Classification {
         .filter(|t| is_episode_length(t.duration.unwrap_or_default()))
         .count();
     if episode_like >= 2 {
+        let confidence = if season_label { 90 } else { 80 };
         return Classification {
             kind: DiscKind::TvSeries,
-            confidence: 80,
+            confidence,
             reasons: vec![format!(
-                "{episode_like} separate titles are episode length (15-45 min)"
+                "{episode_like} separate titles are episode length (15-45 min){}",
+                label_suffix(season_label)
             )],
         };
     }
@@ -91,32 +103,72 @@ pub fn classify(disc: &DiscModel) -> Classification {
         if segments.len() >= 3 {
             let average = mean_duration(&segments);
             if is_episode_length(average) {
+                let confidence = if season_label { 80 } else { 70 };
                 return Classification {
                     kind: DiscKind::TvSeries,
-                    confidence: 70,
+                    confidence,
                     reasons: vec![format!(
-                        "longest title ({}) splits into {} episode-length chapter groups (~{} min each)",
+                        "longest title ({}) splits into {} episode-length chapter groups (~{} min each){}",
                         fmt(longest_duration),
                         segments.len(),
-                        average.as_secs() / 60
+                        average.as_secs() / 60,
+                        label_suffix(season_label)
                     )],
                 };
             }
         }
+
+        // A season marker outranks film-length structure: a disc of
+        // feature-length episodes is still a season.
+        if season_label {
+            return Classification {
+                kind: DiscKind::TvSeries,
+                confidence: 60,
+                reasons: vec![format!(
+                    "label names a season and the longest title is {}",
+                    fmt(longest_duration)
+                )],
+            };
+        }
+
+        let features = feature_titles(disc);
+        if features.len() >= 2 {
+            let durations: Vec<String> = features
+                .iter()
+                .map(|t| fmt(t.duration.unwrap_or_default()))
+                .collect();
+            return Classification {
+                kind: DiscKind::Movie,
+                confidence: 70,
+                reasons: vec![format!(
+                    "{} feature-length titles on one disc ({})",
+                    features.len(),
+                    durations.join(", ")
+                )],
+            };
+        }
+
+        let confidence = if year_label { 75 } else { 65 };
+        let mut reasons = vec![format!("one dominant feature of {}", fmt(longest_duration))];
+        if year_label {
+            reasons.push("label carries a release year and no season marker".into());
+        }
         return Classification {
             kind: DiscKind::Movie,
-            confidence: 65,
-            reasons: vec![format!("one dominant feature of {}", fmt(longest_duration))],
+            confidence,
+            reasons,
         };
     }
 
     if longest_duration >= EPISODE_MIN {
+        let confidence = if season_label { 60 } else { 45 };
         return Classification {
             kind: DiscKind::TvSeries,
-            confidence: 45,
+            confidence,
             reasons: vec![format!(
-                "longest title is {} (episode length, but not a feature film)",
-                fmt(longest_duration)
+                "longest title is {} (episode length, but not a feature film){}",
+                fmt(longest_duration),
+                label_suffix(season_label)
             )],
         };
     }
@@ -125,6 +177,44 @@ pub fn classify(disc: &DiscModel) -> Classification {
         kind: DiscKind::Unknown,
         confidence: 20,
         reasons: vec!["no movie-length or episode-length title found".into()],
+    }
+}
+
+/// Feature-length titles on a disc, longest first.
+///
+/// A double feature, a film plus its long making-of, or a movie split across
+/// titles all show up here, so the movie path can plan more than the single
+/// longest title.
+pub fn feature_titles(disc: &DiscModel) -> Vec<&Title> {
+    let mut features = disc.content_titles(MOVIE_MIN);
+    features.sort_by_key(|t| std::cmp::Reverse(t.duration.unwrap_or_default()));
+    features
+}
+
+/// Bonus content on a movie disc: every title except the main feature that is
+/// long enough to be intentional (menus and warnings are shorter than
+/// [`EXTRA_MIN`]).
+///
+/// This deliberately includes additional *feature-length* titles as well as
+/// short featurettes and trailers, so the selection list can offer everything
+/// that might be worth ripping rather than silently dropping it.
+pub fn movie_extras(disc: &DiscModel) -> Vec<&Title> {
+    let primary = feature_titles(disc).first().map(|t| t.number);
+    let mut extras: Vec<&Title> = disc
+        .titles
+        .iter()
+        .filter(|t| Some(t.number) != primary && t.duration.is_some_and(|d| d >= EXTRA_MIN))
+        .collect();
+    extras.sort_by_key(|t| t.number);
+    extras
+}
+
+/// `, label names a season` when the volume label carried a season number.
+fn label_suffix(season_label: bool) -> &'static str {
+    if season_label {
+        ", label names a season"
+    } else {
+        ""
     }
 }
 
@@ -589,5 +679,98 @@ mod tests {
             titles: vec![a, b],
         };
         assert!(alternates(&disc).is_empty());
+    }
+
+    #[test]
+    fn season_label_outranks_film_length_structure() {
+        let disc = DiscModel {
+            volume_id: "SOME_SHOW_S2".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![title_with((0..12).map(|_| secs(500)).collect())],
+        };
+        let result = classify(&disc);
+        assert_eq!(result.kind, DiscKind::TvSeries);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.contains("label names a season")),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    #[test]
+    fn year_label_corroborates_a_movie() {
+        let disc = DiscModel {
+            volume_id: "THE_MATRIX_1999".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![title_with((0..12).map(|_| secs(500)).collect())],
+        };
+        let result = classify(&disc);
+        assert_eq!(result.kind, DiscKind::Movie);
+        assert_eq!(result.confidence, 75);
+    }
+
+    #[test]
+    fn two_features_are_a_movie_collection() {
+        let disc = DiscModel {
+            volume_id: "DOUBLE_FEATURE".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![
+                block_title(1, &[600; 12], 1), // 120 min
+                block_title(2, &[540; 12], 1), // 108 min
+            ],
+        };
+        let result = classify(&disc);
+        assert_eq!(result.kind, DiscKind::Movie);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.contains("2 feature-length titles")),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    #[test]
+    fn feature_titles_are_longest_first() {
+        let disc = DiscModel {
+            volume_id: "DOUBLE_FEATURE".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![
+                block_title(1, &[540; 12], 1), // 108 min
+                block_title(2, &[600; 12], 1), // 120 min
+            ],
+        };
+        let numbers: Vec<u16> = feature_titles(&disc).iter().map(|t| t.number).collect();
+        assert_eq!(numbers, vec![2, 1]);
+    }
+
+    #[test]
+    fn movie_extras_cover_bonus_and_second_features() {
+        // Title 1 is the feature, title 2 a second feature, title 3 a 20-minute
+        // making-of, title 4 a 3-minute trailer and title 5 a menu sting.
+        let disc = DiscModel {
+            volume_id: "DOUBLE_FEATURE".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![
+                title_with((0..12).map(|_| secs(600)).collect()), // 120 min
+                block_title(2, &[600; 12], 1),                    // 120 min
+                block_title(3, &[600; 2], 1),                     // 20 min
+                block_title(4, &[180], 1),                        // 3 min
+                block_title(5, &[10], 1),                         // 10 s menu
+            ],
+        };
+        let numbers: Vec<u16> = movie_extras(&disc).iter().map(|t| t.number).collect();
+        // The longest stays the feature even though it was listed first.
+        assert_eq!(numbers, vec![2, 3, 4]);
+        assert_eq!(feature_titles(&disc).first().unwrap().number, 1);
     }
 }

@@ -14,6 +14,7 @@ oxideav-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
+strsim.workspace = true
 
 [features]
 # Link libdvdcss for CSS decryption on raw optical devices.

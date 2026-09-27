@@ -62,6 +62,31 @@ pub fn movie_file_in(movies_dir: &Path, title: &str, year: Option<u16>) -> PathB
     movie_dir_in(movies_dir, title, year).join(format!("{name}.mkv"))
 }
 
+/// One part of a movie delivered across several files, inside `movies_dir`:
+/// `<movies_dir>/<Title (Year)>/<Title (Year)> - partN.mkv` (the form Plex and
+/// Jellyfin both treat as one movie).
+pub fn movie_part_file_in(movies_dir: &Path, title: &str, year: Option<u16>, part: u16) -> PathBuf {
+    let name = display_name(title, year);
+    movie_dir_in(movies_dir, title, year).join(format!("{name} - part{part}.mkv"))
+}
+
+/// Extra (trailer/featurette) belonging to a movie:
+/// `<movies_dir>/<Title (Year)>/Other/<Description>.mkv`.
+///
+/// `Other/` is an extras folder Plex, Jellyfin and Emby all recognise, the
+/// same choice [`extra_file_in`] makes for TV.
+pub fn movie_extra_file_in(
+    movies_dir: &Path,
+    title: &str,
+    year: Option<u16>,
+    description: &str,
+) -> PathBuf {
+    let name = sanitize_component(description);
+    movie_dir_in(movies_dir, title, year)
+        .join("Other")
+        .join(format!("{name}.mkv"))
+}
+
 /// Show folder inside `tv_dir`: `<tv_dir>/<Show (Year)>`.
 pub fn show_dir_in(tv_dir: &Path, show: &str, year: Option<u16>) -> PathBuf {
     tv_dir.join(display_name(show, year))
@@ -219,6 +244,26 @@ mod tests {
         assert_eq!(
             path,
             Path::new("/lib/Movies/The Matrix (1999)/The Matrix (1999).mkv")
+        );
+    }
+
+    #[test]
+    fn builds_movie_part_and_extra_paths() {
+        let part = movie_part_file_in(Path::new("/movies"), "The Matrix", Some(1999), 2);
+        assert_eq!(
+            part,
+            Path::new("/movies/The Matrix (1999)/The Matrix (1999) - part2.mkv")
+        );
+
+        let extra = movie_extra_file_in(
+            Path::new("/movies"),
+            "The Matrix",
+            Some(1999),
+            "Behind The Scenes",
+        );
+        assert_eq!(
+            extra,
+            Path::new("/movies/The Matrix (1999)/Other/Behind The Scenes.mkv")
         );
     }
 

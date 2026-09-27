@@ -19,6 +19,9 @@ pub struct Config {
     pub tv_dir: Option<PathBuf>,
     /// Directory holding movie folders, e.g. `/mnt/dvd/media/movies`.
     pub movie_dir: Option<PathBuf>,
+    /// TMDb API key or v4 read access token. Optional: without it, movies are
+    /// named from the disc label. Stored in plaintext.
+    pub tmdb_api_key: Option<String>,
     /// Optical drive last used in the interactive guide, e.g. `/dev/sr1`.
     pub last_device: Option<PathBuf>,
     /// Open the tray once a rip finishes without failures.
@@ -56,6 +59,7 @@ impl Config {
             match key.trim() {
                 "tv_dir" => config.tv_dir = Some(expand_tilde(&value)),
                 "movie_dir" => config.movie_dir = Some(expand_tilde(&value)),
+                "tmdb_api_key" => config.tmdb_api_key = Some(value),
                 "last_device" => config.last_device = Some(expand_tilde(&value)),
                 "auto_eject" => config.auto_eject = parse_bool(&value),
                 _ => {}
@@ -78,6 +82,9 @@ impl Config {
                 "movie_dir = \"{}\"\n",
                 escape(&dir.to_string_lossy())
             ));
+        }
+        if let Some(key) = &self.tmdb_api_key {
+            out.push_str(&format!("tmdb_api_key = \"{}\"\n", escape(key)));
         }
         if let Some(device) = &self.last_device {
             out.push_str(&format!(
@@ -108,6 +115,26 @@ impl Config {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(true)
     }
+
+    /// The TMDb key to use, if any.
+    ///
+    /// `TMDB_API_KEY` (or `PACKRAT_TMDB_KEY`) overrides the saved value, so a
+    /// headless run can supply the key without touching the config file.
+    pub fn tmdb_key(&self) -> Option<String> {
+        let env = std::env::var("TMDB_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("PACKRAT_TMDB_KEY").ok());
+        key_precedence(self.tmdb_api_key.clone(), env)
+    }
+}
+
+/// Prefer the environment key, then the saved one; blank values are ignored.
+fn key_precedence(saved: Option<String>, env: Option<String>) -> Option<String> {
+    let clean = |value: String| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    env.and_then(clean).or_else(|| saved.and_then(clean))
 }
 
 /// Path of the preferences file, e.g. `~/.config/packrat/config.toml`.
@@ -207,6 +234,7 @@ mod tests {
 # a comment
 tv_dir = \"/mnt/dvd/media/tv\"
 movie_dir = '/mnt/dvd/media/movies'
+tmdb_api_key = \"abc123\"
 last_device = \"/dev/sr1\"
 auto_eject = true
 unknown = 3
@@ -220,9 +248,28 @@ unknown = 3
             config.movie_dir.as_deref(),
             Some(Path::new("/mnt/dvd/media/movies"))
         );
+        assert_eq!(config.tmdb_api_key.as_deref(), Some("abc123"));
         assert_eq!(config.last_device.as_deref(), Some(Path::new("/dev/sr1")));
         assert!(config.auto_eject);
         assert_eq!(Config::parse(&config.render()), config);
+    }
+
+    #[test]
+    fn environment_key_overrides_the_saved_one() {
+        assert_eq!(
+            key_precedence(Some("saved".into()), Some("env".into())).as_deref(),
+            Some("env")
+        );
+        assert_eq!(
+            key_precedence(Some("saved".into()), None).as_deref(),
+            Some("saved")
+        );
+        // A blank environment value falls through to the saved key.
+        assert_eq!(
+            key_precedence(Some("saved".into()), Some("   ".into())).as_deref(),
+            Some("saved")
+        );
+        assert_eq!(key_precedence(None, Some("  ".into())), None);
     }
 
     #[test]
@@ -245,6 +292,7 @@ unknown = 3
         let config = Config {
             tv_dir: Some(PathBuf::from("C:\\Media\\TV \"x\"")),
             movie_dir: None,
+            tmdb_api_key: Some("key.with.dots".into()),
             last_device: Some(PathBuf::from("\\\\.\\D:")),
             auto_eject: true,
         };

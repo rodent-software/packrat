@@ -16,6 +16,9 @@ packrat plan /run/media/$USER/DRAGON_BALL_S1_D1
 
 # Match on TVmaze and print the proposed Plex layout (read-only)
 packrat identify /run/media/$USER/DRAGON_BALL_S1_D1 --library /mnt/media
+
+# A movie disc is matched on TMDb instead, when a key is configured
+packrat identify /run/media/$USER/THE_MATRIX_1999 --movie-dir /mnt/media/Movies
 ```
 
 ## Rip and split
@@ -32,6 +35,14 @@ packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out
 # ...or write directly into a Plex library, named from TVmaze metadata
 packrat split /run/media/$USER/DRAGON_BALL_S1_D1 --out-dir out \
   --library /mnt/media --dry-run
+
+# A movie disc is ripped as its main feature, named from TMDb when a key is set
+packrat split /run/media/$USER/THE_MATRIX_1999 --out-dir out \
+  --movie-dir /mnt/media/Movies --include-extras --dry-run
+
+# Override the title or year TMDb is searched with
+packrat split /run/media/$USER/DVD_LABEL --out-dir out \
+  --movie-dir /mnt/media/Movies --movie "The Matrix" --year 1999
 ```
 
 `--dry-run` prints the plan without remuxing anything, which is the quickest
@@ -60,6 +71,14 @@ packrat watch --include-extras
 <root>/Movies`, for libraries laid out with Plex's conventional category
 folders. An explicit flag wins over `--library`, which wins over a saved
 preference.
+
+Movie matching is optional. Add a **TMDb API key** on the settings screen (or
+set `TMDB_API_KEY` or `PACKRAT_TMDB_KEY`, which win over the saved value) and
+movie discs are searched on TMDb and named from the match. Both the v3 API key
+and the v4 read access token are accepted. Without a key — or when no result
+clears the confidence threshold — the movie is named from the disc label, so
+ripping never depends on the network. The key is stored in plaintext in the
+config file, like the other preferences.
 
 The settings screen also has **Eject when done**, which opens the tray once a
 rip finishes without failures. Press `x` to eject on demand: from a plan it
@@ -112,7 +131,11 @@ Remuxing copies MPEG-2 video and AC-3/DTS audio bit-for-bit — there is no
 re-encode. The output carries the source `Chapter` timeline and (once the
 duration is known) a container duration.
 
-Short titles (trailers, featurettes) are skipped by default; pass
-`--include-extras` to put them under `<show>/Other/`. Titles that look like a
-second copy of the same episodes (with and without the opening/ending) are
-collapsed automatically so a season is not ripped twice.
+Short titles (trailers, featurettes) are skipped by default on a TV disc; pass
+`--include-extras` to put them under `<show>/Other/`. A movie disc always lists
+the main feature and every bonus title — featurettes, trailers, even a second
+feature — in the file list, with only the feature selected. Tick the ones you
+want, or press `e` to select or clear them all. The headless equivalent is
+`--include-extras`, which writes the bonus titles under `<movie>/Other/`.
+Titles that look like a second copy of the same episodes (with and without the
+opening/ending) are collapsed automatically so a season is not ripped twice.

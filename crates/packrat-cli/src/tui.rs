@@ -23,14 +23,14 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, 
 use ratatui::{DefaultTerminal, Frame};
 
 use packrat_core::{
-    classify, movie_file_in, parse_label, preferred_titles, read_disc, read_vts,
-    remux_chain_with_progress_and_cancel, split_title, Classification, DiscError, DiscKind,
-    DiscModel, DiscSource, LabelInfo, OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show,
-    Title, EXTRA_MIN, MIN_CONTENT,
+    classify, display_name, feature_titles, movie_extra_file_in, movie_extras, movie_file_in,
+    parse_label, preferred_titles, read_disc, read_vts, remux_chain_with_progress_and_cancel,
+    split_title, Classification, DiscError, DiscKind, DiscModel, DiscSource, LabelInfo, Movie,
+    OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show, Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 use crate::config::{self, Config};
-use crate::{resolve_naming, Naming};
+use crate::{resolve_movie_naming, resolve_naming, MovieNaming, Naming};
 
 /// Spinner frames used while a background task runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -134,15 +134,17 @@ enum Field {
 enum ConfigField {
     TvDir,
     MovieDir,
+    TmdbKey,
     AutoEject,
 }
 
 impl ConfigField {
     /// Every setting, in tab order. This is the one list to extend when a new
     /// media type gains its own destination.
-    const ALL: [ConfigField; 3] = [
+    const ALL: [ConfigField; 4] = [
         ConfigField::TvDir,
         ConfigField::MovieDir,
+        ConfigField::TmdbKey,
         ConfigField::AutoEject,
     ];
 
@@ -171,6 +173,7 @@ impl ConfigField {
         match self {
             Self::TvDir => " TV directory ",
             Self::MovieDir => " Movie directory ",
+            Self::TmdbKey => " TMDb API key ",
             Self::AutoEject => " Eject when done ",
         }
     }
@@ -179,6 +182,7 @@ impl ConfigField {
         match self {
             Self::TvDir => "the folder that holds show folders, e.g. /mnt/media/tv",
             Self::MovieDir => "the folder that holds movie folders, e.g. /mnt/media/movies",
+            Self::TmdbKey => "optional; without it movies are named from the disc label",
             Self::AutoEject => "Eject the disc automatically once a rip finishes",
         }
     }
@@ -340,6 +344,12 @@ enum WorkerEvent {
         naming: Option<Naming>,
         note: Option<String>,
     },
+    MovieMetaReady {
+        naming: MovieNaming,
+        movie: Option<Movie>,
+        candidates: Vec<(f64, Movie)>,
+        note: Option<String>,
+    },
     MetaError(String),
     JobStarted(usize),
     JobProgress {
@@ -431,6 +441,7 @@ struct App {
     season_input: TextInput,
     tv_input: TextInput,
     movie_input: TextInput,
+    tmdb_input: TextInput,
     /// Open the tray automatically when a rip finishes cleanly.
     auto_eject: bool,
     /// A rip or an explicit command has opened the tray; the loaded disc is
@@ -442,7 +453,14 @@ struct App {
     eject_note: Option<String>,
     include_extras: bool,
     naming: Option<Naming>,
+    /// Metadata naming for a movie disc, when one was resolved.
+    movie_naming: Option<MovieNaming>,
     meta_show: Option<Show>,
+    /// Auto-accepted TMDb match for a movie disc.
+    meta_movie: Option<Movie>,
+    /// Ranked TMDb candidates offered when no match cleared the threshold.
+    movie_candidates: Vec<(f64, Movie)>,
+    movie_cursor: usize,
     meta_note: Option<String>,
     meta_state: MetaState,
     jobs: Vec<Job>,
@@ -480,6 +498,7 @@ impl App {
         let config = Config::load();
         let tv_input = TextInput::from(&display_path(config.tv_dir.as_deref()));
         let movie_input = TextInput::from(&display_path(config.movie_dir.as_deref()));
+        let tmdb_input = TextInput::from(config.tmdb_api_key.as_deref().unwrap_or(""));
         Self {
             stage: Stage::Detect,
             tx,
@@ -507,6 +526,7 @@ impl App {
             season_input: TextInput::default(),
             tv_input,
             movie_input,
+            tmdb_input,
             config_focus: ConfigField::TvDir,
             config_return: Stage::Detect,
             config_onboarding: false,
@@ -517,7 +537,11 @@ impl App {
             eject_note: None,
             include_extras: false,
             naming: None,
+            movie_naming: None,
             meta_show: None,
+            meta_movie: None,
+            movie_candidates: Vec::new(),
+            movie_cursor: 0,
             meta_note: None,
             meta_state: MetaState::Idle,
             jobs: Vec::new(),
@@ -617,6 +641,7 @@ impl App {
         match field {
             ConfigField::TvDir => &self.tv_input,
             ConfigField::MovieDir => &self.movie_input,
+            ConfigField::TmdbKey => &self.tmdb_input,
             ConfigField::AutoEject => unreachable!("the eject toggle is not a text field"),
         }
     }
@@ -625,6 +650,7 @@ impl App {
         match field {
             ConfigField::TvDir => &mut self.tv_input,
             ConfigField::MovieDir => &mut self.movie_input,
+            ConfigField::TmdbKey => &mut self.tmdb_input,
             ConfigField::AutoEject => unreachable!("the eject toggle is not a text field"),
         }
     }
@@ -634,6 +660,7 @@ impl App {
         let config = Config::load();
         self.tv_input = TextInput::from(&display_path(config.tv_dir.as_deref()));
         self.movie_input = TextInput::from(&display_path(config.movie_dir.as_deref()));
+        self.tmdb_input = TextInput::from(config.tmdb_api_key.as_deref().unwrap_or(""));
         self.auto_eject = config.auto_eject;
     }
 
@@ -706,7 +733,11 @@ impl App {
         self.device = None;
         self.loaded = None;
         self.naming = None;
+        self.movie_naming = None;
         self.meta_show = None;
+        self.meta_movie = None;
+        self.movie_candidates.clear();
+        self.movie_cursor = 0;
         self.meta_note = None;
         self.meta_state = MetaState::Idle;
         self.jobs.clear();
@@ -979,6 +1010,12 @@ impl App {
                             self.job_cursor += 1;
                         }
                     }
+                    KeyCode::Char('[') if !self.movie_candidates.is_empty() => {
+                        self.cycle_movie_candidate(-1);
+                    }
+                    KeyCode::Char(']') if !self.movie_candidates.is_empty() => {
+                        self.cycle_movie_candidate(1);
+                    }
                     KeyCode::Char(' ') => {
                         if let Some(job) = self.jobs.get_mut(self.job_cursor) {
                             job.enabled = !job.enabled;
@@ -990,10 +1027,7 @@ impl App {
                             job.enabled = !all;
                         }
                     }
-                    KeyCode::Char('e') => {
-                        self.include_extras = !self.include_extras;
-                        self.rebuild_jobs();
-                    }
+                    KeyCode::Char('e') => self.toggle_extras(),
                     KeyCode::Char('r') => self.start_rip(),
                     KeyCode::Char('s') => self.open_config(),
                     KeyCode::Char('x') => self.eject_loaded_disc(true),
@@ -1013,6 +1047,12 @@ impl App {
 
     fn movie_path(&self) -> Option<PathBuf> {
         path_from(&self.movie_input)
+    }
+
+    /// The optional TMDb key as typed on the settings screen.
+    fn tmdb_key(&self) -> Option<String> {
+        let key = self.tmdb_input.trimmed();
+        (!key.is_empty()).then_some(key)
     }
 
     fn load_manual_path(&mut self) {
@@ -1042,18 +1082,18 @@ impl App {
         });
     }
 
-    /// Recompute the metadata and job list after the user edits the show or
-    /// season.
+    /// Recompute the metadata and job list after the user edits the show and
+    /// season, or the movie title and year.
     fn apply_edits(&mut self) {
         self.meta_note = None;
         let Some(disc) = self.disc.clone() else {
             return;
         };
+        // For a movie disc these two inputs carry the title and release year.
         let show = self.show_input.trimmed();
         let show = if show.is_empty() { None } else { Some(show) };
         let season = self.season_input.trimmed().parse::<u16>().ok();
 
-        // Movies are named from the disc label, so no metadata lookup is needed.
         let is_movie = self
             .classification
             .as_ref()
@@ -1062,8 +1102,43 @@ impl App {
         if is_movie {
             self.naming = None;
             self.meta_show = None;
-            self.meta_state = MetaState::Idle;
-            self.rebuild_jobs();
+            self.meta_movie = None;
+            self.movie_candidates.clear();
+            self.movie_cursor = 0;
+
+            let feature = feature_titles(&disc).first().copied().cloned();
+            let Some((movie_dir, feature)) = self.movie_path().zip(feature) else {
+                self.movie_naming = None;
+                self.meta_state = MetaState::Idle;
+                self.meta_note = Some("set a movie directory to name files from metadata".into());
+                self.rebuild_jobs();
+                return;
+            };
+
+            self.meta_state = MetaState::Loading;
+            let tx = self.tx.clone();
+            let title_override = show;
+            std::thread::spawn(move || {
+                match resolve_movie_naming(
+                    &movie_dir,
+                    &disc,
+                    &feature,
+                    title_override.as_deref(),
+                    season,
+                ) {
+                    Ok(resolved) => {
+                        let _ = tx.send(WorkerEvent::MovieMetaReady {
+                            naming: resolved.naming,
+                            movie: resolved.movie,
+                            candidates: resolved.candidates,
+                            note: resolved.warning,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerEvent::MetaError(format!("{e:#}")));
+                    }
+                }
+            });
             return;
         }
 
@@ -1102,6 +1177,7 @@ impl App {
         let config = Config {
             tv_dir: self.tv_path(),
             movie_dir: self.movie_path(),
+            tmdb_api_key: self.tmdb_key(),
             last_device: self.last_device.clone(),
             auto_eject: self.auto_eject,
         };
@@ -1126,11 +1202,51 @@ impl App {
             &disc,
             &classification,
             self.naming.as_ref(),
+            self.movie_naming.as_ref(),
             movie_dir.as_deref(),
             &out_dir,
             self.include_extras,
         );
         self.set_jobs(jobs);
+    }
+
+    /// Move through the TMDb candidate list, rewriting the movie naming so the
+    /// job list previews the chosen title.
+    fn cycle_movie_candidate(&mut self, delta: isize) {
+        let len = self.movie_candidates.len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.movie_cursor as isize + delta).rem_euclid(len as isize) as usize;
+        let chosen = self.movie_candidates[next].1.clone();
+        self.movie_cursor = next;
+        self.meta_movie = Some(chosen.clone());
+        if let Some(naming) = self.movie_naming.as_mut() {
+            naming.retitle(chosen.title.clone(), chosen.year());
+        }
+        self.rebuild_jobs();
+    }
+
+    /// Toggle which bonus files are selected.
+    ///
+    /// On a TV disc `e` reveals or hides extras, so the job list is rebuilt. On
+    /// a movie disc every title is always listed, so `e` just flips the
+    /// selection of all non-primary files.
+    fn toggle_extras(&mut self) {
+        let is_movie = self
+            .classification
+            .as_ref()
+            .is_some_and(|c| c.kind == DiscKind::Movie);
+        if !is_movie {
+            self.include_extras = !self.include_extras;
+            self.rebuild_jobs();
+            return;
+        }
+        let all_on = self.jobs.len() > 1 && self.jobs.iter().skip(1).all(|job| job.enabled);
+        for job in self.jobs.iter_mut().skip(1) {
+            job.enabled = !all_on;
+        }
+        self.include_extras = !all_on;
     }
 
     /// Replace the job list, carrying over each job's enabled state so a
@@ -1266,17 +1382,25 @@ impl App {
                     return;
                 }
                 self.loaded = Some(fingerprint);
+                let is_movie = classification.kind == DiscKind::Movie;
                 self.show_input = TextInput::from(&label.title);
-                self.season_input = TextInput::from(
-                    &label
-                        .season
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(String::new),
-                );
+                let secondary = if is_movie {
+                    label.year.map(|y| y.to_string())
+                } else {
+                    label.season.map(|s| s.to_string())
+                };
+                self.season_input = TextInput::from(&secondary.unwrap_or_default());
                 self.source = Some(source);
                 self.disc = Some(disc);
                 self.classification = Some(classification);
                 self.label = Some(label);
+                self.naming = None;
+                self.movie_naming = None;
+                self.meta_show = None;
+                self.meta_movie = None;
+                self.movie_candidates.clear();
+                self.movie_cursor = 0;
+                self.meta_note = None;
                 self.ejected = false;
                 self.eject_then_picker = false;
                 self.eject_note = None;
@@ -1293,14 +1417,14 @@ impl App {
                 self.stage = Stage::Plan;
                 self.rebuild_jobs();
 
-                // With a TV destination already configured, look metadata up
-                // straight away so episode titles fill in without pressing
-                // Enter first.
-                let is_tv = self
-                    .classification
-                    .as_ref()
-                    .is_some_and(|c| c.kind != DiscKind::Movie);
-                if is_tv && self.tv_path().is_some() {
+                // With a destination already configured, look metadata up
+                // straight away so titles fill in without pressing Enter first.
+                let wants_lookup = if is_movie {
+                    self.movie_path().is_some()
+                } else {
+                    self.tv_path().is_some()
+                };
+                if wants_lookup {
                     self.apply_edits();
                 }
             }
@@ -1330,6 +1454,20 @@ impl App {
                 self.meta_state = MetaState::Ready;
                 self.meta_show = show;
                 self.naming = naming;
+                self.meta_note = note;
+                self.rebuild_jobs();
+            }
+            WorkerEvent::MovieMetaReady {
+                naming,
+                movie,
+                candidates,
+                note,
+            } => {
+                self.meta_state = MetaState::Ready;
+                self.movie_naming = Some(naming);
+                self.meta_movie = movie;
+                self.movie_candidates = candidates;
+                self.movie_cursor = 0;
                 self.meta_note = note;
                 self.rebuild_jobs();
             }
@@ -1792,26 +1930,40 @@ impl App {
     }
 
     fn render_plan(&self, f: &mut Frame, area: Rect) {
-        let rows = Layout::vertical([
-            // Disc, looks-like, parsed and TVmaze lines inside a bordered block.
+        let is_movie = self
+            .classification
+            .as_ref()
+            .is_some_and(|c| c.kind == DiscKind::Movie);
+        let show_candidates = self.movie_candidates.len() > 1;
+
+        let mut constraints = vec![
+            // Disc, looks-like, parsed and metadata lines inside a bordered block.
             Constraint::Length(6),
             Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(5),
-        ])
-        .split(area);
+        ];
+        if show_candidates {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Min(5));
+        let rows = Layout::vertical(constraints).split(area);
 
         self.render_disc_summary(f, rows[0]);
 
-        // Show + season side by side.
+        // For TV these are Show + Season; for movies, Title + Year.
+        let (first_title, first_hint, second_title) = if is_movie {
+            (" Title ", "TMDb searches this name", " Year ")
+        } else {
+            (" Show ", "TVmaze searches this name", " Season ")
+        };
         let fields = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(rows[1]);
         f.render_widget(
             self.field(
-                " Show ",
+                first_title,
                 &self.show_input,
                 self.focus == Field::Show,
-                "TVmaze searches this name",
+                first_hint,
             ),
             fields[0],
         );
@@ -1820,7 +1972,7 @@ impl App {
         }
         f.render_widget(
             self.field(
-                " Season ",
+                second_title,
                 &self.season_input,
                 self.focus == Field::Season,
                 "",
@@ -1831,17 +1983,52 @@ impl App {
             set_cursor(f, fields[1], &self.season_input);
         }
 
+        let mut row = 2;
+        if show_candidates {
+            f.render_widget(self.candidate_line(), rows[row]);
+            row += 1;
+        }
+
         let checkbox = if self.include_extras { "[x]" } else { "[ ]" };
+        let extras_label = if is_movie {
+            "Select extras (trailers and featurettes)"
+        } else {
+            "Include extras (trailers and featurettes)"
+        };
         let extras = vec![
             Span::styled(format!(" {checkbox} "), Style::default().fg(Color::Cyan)),
-            Span::raw("Include extras (trailers and featurettes)"),
+            Span::raw(extras_label),
             Span::styled("   e to toggle", Style::default().fg(Color::DarkGray)),
         ];
-        f.render_widget(Paragraph::new(Line::from(extras)), rows[2]);
+        f.render_widget(Paragraph::new(Line::from(extras)), rows[row]);
+        row += 1;
 
         let selected = self.jobs.iter().filter(|j| j.enabled).count();
         let title = format!(" Files — {selected} of {} selected ", self.jobs.len());
-        self.render_job_list(f, rows[3], title, Some(self.job_cursor), true);
+        self.render_job_list(f, rows[row], title, Some(self.job_cursor), true);
+    }
+
+    /// The TMDb candidate currently highlighted, with a hint for changing it.
+    fn candidate_line(&self) -> Paragraph<'static> {
+        let index = self.movie_cursor.min(self.movie_candidates.len() - 1);
+        let (score, movie) = &self.movie_candidates[index];
+        let year = movie.year().map(|y| format!(" ({y})")).unwrap_or_default();
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Candidate ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}  ", index + 1, self.movie_candidates.len()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(movie.title.clone()),
+            Span::styled(
+                format!("{year}  {:.0}%", score * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "   [ ] to change    Enter to re-search",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
     }
 
     /// A bordered text field, brightening when focused.
@@ -1895,23 +2082,32 @@ impl App {
             ]));
         }
         if let Some(label) = &self.label {
+            let is_movie = self
+                .classification
+                .as_ref()
+                .is_some_and(|c| c.kind == DiscKind::Movie);
+            let detail = if is_movie {
+                label
+                    .year
+                    .map(|y| format!("  year {y}"))
+                    .unwrap_or_default()
+            } else {
+                format!(
+                    "  season {}  disc {}",
+                    label
+                        .season
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    label
+                        .disc
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                )
+            };
             lines.push(Line::from(vec![
                 Span::styled(" Parsed  ", Style::default().fg(Color::DarkGray)),
                 Span::raw(label.title.clone()),
-                Span::styled(
-                    format!(
-                        "  season {}  disc {}",
-                        label
-                            .season
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "?".into()),
-                        label
-                            .disc
-                            .map(|d| d.to_string())
-                            .unwrap_or_else(|| "?".into()),
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
             ]));
         }
         lines.push(self.metadata_line());
@@ -1925,40 +2121,62 @@ impl App {
     }
 
     fn metadata_line(&self) -> Line<'static> {
+        let is_movie = self
+            .classification
+            .as_ref()
+            .is_some_and(|c| c.kind == DiscKind::Movie);
+        let source = if is_movie { " TMDb   " } else { " TVmaze " };
+        let idle = if is_movie {
+            "set a TMDb key and movie directory, then press Enter"
+        } else {
+            "set a library and press Enter to match"
+        };
         match self.meta_state {
             MetaState::Loading => {
                 let spinner = SPINNER[(self.tick / 2) % SPINNER.len()];
                 Line::from(vec![
-                    Span::styled(" TVmaze  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(source, Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{spinner} looking up…"),
                         Style::default().fg(Color::Yellow),
                     ),
                 ])
             }
-            MetaState::Ready => match &self.meta_show {
-                Some(show) => Line::from(vec![
-                    Span::styled(" TVmaze  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(show.name.clone(), Style::default().fg(Color::Green)),
-                    Span::styled(
-                        show.year().map(|y| format!("  ({y})")).unwrap_or_default(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
-                None => Line::from(vec![
-                    Span::styled(" TVmaze  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        self.meta_note.clone().unwrap_or_else(|| "no match".into()),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ]),
-            },
+            MetaState::Ready => {
+                let matched = if is_movie {
+                    self.meta_movie.as_ref().map(|movie| {
+                        (
+                            movie.title.clone(),
+                            movie.year().map(|y| format!("  ({y})")).unwrap_or_default(),
+                        )
+                    })
+                } else {
+                    self.meta_show.as_ref().map(|show| {
+                        (
+                            show.name.clone(),
+                            show.year().map(|y| format!("  ({y})")).unwrap_or_default(),
+                        )
+                    })
+                };
+                match matched {
+                    Some((name, year)) => Line::from(vec![
+                        Span::styled(source, Style::default().fg(Color::DarkGray)),
+                        Span::styled(name, Style::default().fg(Color::Green)),
+                        Span::styled(year, Style::default().fg(Color::DarkGray)),
+                    ]),
+                    None => Line::from(vec![
+                        Span::styled(source, Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            self.meta_note.clone().unwrap_or_else(|| "no match".into()),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]),
+                }
+            }
             MetaState::Idle => Line::from(vec![
-                Span::styled(" TVmaze  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(source, Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    self.meta_note
-                        .clone()
-                        .unwrap_or_else(|| "set a library and press Enter to match".into()),
+                    self.meta_note.clone().unwrap_or_else(|| idle.into()),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
@@ -2455,6 +2673,7 @@ fn assemble_jobs(
     disc: &DiscModel,
     classification: &Classification,
     naming: Option<&Naming>,
+    movie_naming: Option<&MovieNaming>,
     movie_dir: Option<&Path>,
     out_dir: &Path,
     include_extras: bool,
@@ -2462,17 +2681,37 @@ fn assemble_jobs(
     let mut jobs = Vec::new();
 
     if classification.kind == DiscKind::Movie {
-        if let Some(film) = disc
-            .content_titles(MIN_CONTENT)
-            .into_iter()
-            .max_by_key(|t| t.duration)
-        {
-            let label = parse_label(&disc.volume_id);
-            let path = match movie_dir {
-                Some(dir) => movie_file_in(dir, &label.title, label.year),
-                None => out_dir.join(format!("{}.mkv", label.title)),
+        let label = parse_label(&disc.volume_id);
+        if let Some(film) = feature_titles(disc).first().copied() {
+            let path = match movie_naming {
+                Some(naming) => naming.feature_path(),
+                None => match movie_dir {
+                    Some(dir) => movie_file_in(dir, &label.title, label.year),
+                    None => out_dir.join(format!("{}.mkv", label.title)),
+                },
             };
             jobs.push(Job::new(film, 1, film.chapters, path));
+        }
+
+        // Every other title is listed so the user can pick; extras start
+        // selected only when the extras toggle is on. This is one selection
+        // surface, not a reveal-then-choose two-step.
+        for title in movie_extras(disc) {
+            let description = format!("Title {:02}", title.number);
+            let path = match movie_naming {
+                Some(naming) => naming.extra_path(&description),
+                None => match movie_dir {
+                    Some(dir) => movie_extra_file_in(dir, &label.title, label.year, &description),
+                    None => out_dir.join(format!(
+                        "{} - {}.mkv",
+                        display_name(&label.title, label.year),
+                        description
+                    )),
+                },
+            };
+            let mut job = Job::new(title, 1, title.chapters, path);
+            job.enabled = include_extras;
+            jobs.push(job);
         }
         return jobs;
     }
@@ -2692,6 +2931,7 @@ mod tests {
             &d,
             &kind(DiscKind::Movie),
             None,
+            None,
             Some(Path::new("/lib")),
             Path::new("."),
             false,
@@ -2702,6 +2942,40 @@ mod tests {
         assert_eq!(jobs[0].last, 10);
         assert!(jobs[0].path.starts_with("/lib"));
         assert_eq!(jobs[0].path.extension().unwrap(), "mkv");
+    }
+
+    #[test]
+    fn movie_extras_are_listed_and_selected_by_the_toggle() {
+        // A 100-minute feature plus a 200-second featurette.
+        let d = disc(vec![title(1, 10, 600), title(2, 1, 200)]);
+
+        let off = assemble_jobs(
+            &d,
+            &kind(DiscKind::Movie),
+            None,
+            None,
+            Some(Path::new("/lib")),
+            Path::new("."),
+            false,
+        );
+        // Both are listed, but only the feature starts selected.
+        assert_eq!(off.len(), 2);
+        assert!(off[0].enabled);
+        let extra = off.iter().find(|j| j.title == 2).expect("extra");
+        assert!(!extra.enabled);
+        assert!(extra.path.starts_with("/lib"));
+        assert!(extra.path.to_string_lossy().contains("Other"));
+
+        let on = assemble_jobs(
+            &d,
+            &kind(DiscKind::Movie),
+            None,
+            None,
+            Some(Path::new("/lib")),
+            Path::new("."),
+            true,
+        );
+        assert!(on.iter().find(|j| j.title == 2).expect("extra").enabled);
     }
 
     #[test]
@@ -2718,12 +2992,14 @@ mod tests {
             &kind(DiscKind::TvSeries),
             None,
             None,
+            None,
             Path::new("."),
             false,
         );
         let with = assemble_jobs(
             &d,
             &kind(DiscKind::TvSeries),
+            None,
             None,
             None,
             Path::new("."),
@@ -3408,10 +3684,12 @@ mod tests {
     #[test]
     fn config_fields_tab_in_a_cycle() {
         assert_eq!(ConfigField::TvDir.next(), ConfigField::MovieDir);
-        assert_eq!(ConfigField::MovieDir.next(), ConfigField::AutoEject);
+        assert_eq!(ConfigField::MovieDir.next(), ConfigField::TmdbKey);
+        assert_eq!(ConfigField::TmdbKey.next(), ConfigField::AutoEject);
         assert_eq!(ConfigField::AutoEject.next(), ConfigField::TvDir);
         assert_eq!(ConfigField::TvDir.prev(), ConfigField::AutoEject);
-        assert_eq!(ConfigField::AutoEject.prev(), ConfigField::MovieDir);
+        assert_eq!(ConfigField::AutoEject.prev(), ConfigField::TmdbKey);
+        assert_eq!(ConfigField::TmdbKey.prev(), ConfigField::MovieDir);
         assert_eq!(ConfigField::MovieDir.prev(), ConfigField::TvDir);
     }
 

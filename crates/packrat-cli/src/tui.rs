@@ -1696,6 +1696,9 @@ impl App {
         let header_height = if area.height >= 10 { 3 } else { 1 };
         let rows = Layout::vertical([
             Constraint::Length(header_height),
+            // A blank row keeps the header off the body's own top border, so
+            // the two groups do not read as one block.
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -1703,13 +1706,13 @@ impl App {
 
         self.render_header(f, rows[0]);
         match self.stage {
-            Stage::Config => self.render_config(f, rows[1]),
-            Stage::Detect => self.render_detect(f, rows[1]),
-            Stage::Plan => self.render_plan(f, rows[1]),
-            Stage::Ripping => self.render_ripping(f, rows[1]),
-            Stage::Done => self.render_done(f, rows[1]),
+            Stage::Config => self.render_config(f, rows[2]),
+            Stage::Detect => self.render_detect(f, rows[2]),
+            Stage::Plan => self.render_plan(f, rows[2]),
+            Stage::Ripping => self.render_ripping(f, rows[2]),
+            Stage::Done => self.render_done(f, rows[2]),
         }
-        self.render_footer(f, rows[2]);
+        self.render_footer(f, rows[3]);
 
         if self.show_help {
             self.render_help(f, area);
@@ -3349,9 +3352,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|frame| app.ui(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        // Header (3) + gauge (3) puts the progress line on row 6.
+        // Header (3) + spacer (1) + gauge (3) puts the progress line on row 7.
         let row: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 6)].symbol())
+            .map(|x| buffer[(x, 7)].symbol())
             .collect();
 
         assert!(row.contains("read"), "row: {row:?}");
@@ -3387,8 +3390,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|frame| app.ui(frame)).unwrap();
         let buffer = terminal.backend().buffer();
+        // Header (3) + spacer (1) + gauge (3) puts the progress line on row 7.
         let row: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 6)].symbol())
+            .map(|x| buffer[(x, 7)].symbol())
             .collect();
 
         assert!(row.contains("analyzing"), "row: {row:?}");
@@ -3659,6 +3663,28 @@ mod tests {
 
         // The title sits on the very first row, not centred against the mouse.
         assert!(row.contains("packrat"), "row 0: {row:?}");
+    }
+
+    #[test]
+    fn header_sits_above_a_blank_spacer_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+
+        // Header rows 0..3, a blank spacer on row 3, then the body's own top
+        // border opens on row 4.
+        assert_eq!(row(3).trim(), "", "row 3: {:?}", row(3));
+        assert!(row(4).contains('┌'), "row 4: {:?}", row(4));
     }
 
     #[test]
@@ -4012,7 +4038,9 @@ mod tests {
         app.tv_input = TextInput::from("/mnt/media/tv");
         app.movie_input = TextInput::from("/mnt/media/movies");
 
-        let screen = screen(&mut app, 100, 20);
+        // 21 rows is the minimum that fits the intro, four fields and the
+        // saved-to line beneath the header, spacer and footer.
+        let screen = screen(&mut app, 100, 21);
 
         assert!(screen.contains("Settings"), "{screen}");
         assert!(screen.contains("TV directory"), "{screen}");

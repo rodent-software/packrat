@@ -14,8 +14,8 @@ use crate::config::Config;
 use packrat_core::{
     alternates, classify, episode_file_in, episode_range_file_in, extra_file_in, match_episodes,
     match_span, movie_file_in, parse_label, preferred_titles, read_disc, read_vts, remux_chain,
-    search_show, split_title, DiscKind, DiscModel, DiscSource, EpisodeMatch, EpisodeSpan, Show,
-    Title, EXTRA_MIN, MIN_CONTENT,
+    search_show, split_title, DiscKind, DiscModel, DiscSource, Episode, EpisodeMatch, EpisodeSpan,
+    Show, Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 #[derive(Parser)]
@@ -513,6 +513,7 @@ pub(crate) fn resolve_naming(
     };
     let season = season_override.or(label.season).unwrap_or(1);
     let episodes = packrat_core::meta::episodes(show.id).context("fetching episodes")?;
+    let hints = disc_episode_hints(&episodes, season, disc, preferred, label.disc);
 
     let mut by_title = HashMap::new();
     let mut spans = HashMap::new();
@@ -520,16 +521,19 @@ pub(crate) fn resolve_naming(
         let Some(title) = disc.titles.iter().find(|t| t.number == *number) else {
             continue;
         };
+        let hint = hints.get(number).copied();
         let segments = split_title(title);
         if segments.len() < 2 {
             // Delivered as one file: see whether it spans several episodes.
-            if let Some(span) = match_span(&episodes, season, title.duration.unwrap_or_default()) {
+            if let Some(span) =
+                match_span(&episodes, season, title.duration.unwrap_or_default(), hint)
+            {
                 spans.insert(*number, span);
             }
             continue;
         }
         let durations: Vec<Duration> = segments.iter().map(|s| s.duration).collect();
-        by_title.insert(*number, match_episodes(&episodes, season, &durations));
+        by_title.insert(*number, match_episodes(&episodes, season, &durations, hint));
     }
 
     let year = show.year();
@@ -547,6 +551,74 @@ pub(crate) fn resolve_naming(
         }),
         warning: None,
     })
+}
+
+/// Guess where each preferred title starts within its season, so a disc other
+/// than the first does not restart at episode 1.
+///
+/// A DVD label carries a disc number but no episode count, so we assume each
+/// disc covers a contiguous block and estimate the block size from how many
+/// episodes this disc appears to hold. For a "Play All" title that is the
+/// number of segments it splits into; for separate per-episode titles, the
+/// title's runtime divided by the season's average episode runtime stands in.
+fn disc_episode_hints(
+    episodes: &[Episode],
+    season: u16,
+    disc: &DiscModel,
+    preferred: &[u16],
+    disc_number: Option<u16>,
+) -> HashMap<u16, usize> {
+    let average = average_runtime(episodes, season);
+    let mut hints = HashMap::new();
+    let mut before = 0usize;
+    for number in preferred {
+        let Some(title) = disc.titles.iter().find(|t| t.number == *number) else {
+            continue;
+        };
+        hints.insert(*number, before);
+        let segments = split_title(title);
+        before += if segments.len() >= 2 {
+            segments.len()
+        } else {
+            estimated_episodes(title.duration, average)
+        };
+    }
+
+    // The disc's own estimated episode count is our best guess at how many
+    // episodes precede it on every earlier disc.
+    let per_disc = before.max(1);
+    let start = usize::from(disc_number.unwrap_or(1).saturating_sub(1)) * per_disc;
+    hints
+        .into_iter()
+        .map(|(number, offset)| (number, start + offset))
+        .collect()
+}
+
+/// Mean runtime of a season's episodes, when the provider supplies any.
+fn average_runtime(episodes: &[Episode], season: u16) -> Option<Duration> {
+    let runtimes: Vec<u64> = episodes
+        .iter()
+        .filter(|e| e.season == u32::from(season))
+        .filter_map(|e| e.runtime)
+        .map(|minutes| u64::from(minutes) * 60)
+        .collect();
+    if runtimes.is_empty() {
+        return None;
+    }
+    Some(Duration::from_secs(
+        runtimes.iter().sum::<u64>() / runtimes.len() as u64,
+    ))
+}
+
+/// How many episodes a single whole-file title is likely to contain.
+fn estimated_episodes(duration: Option<Duration>, average: Option<Duration>) -> usize {
+    match (duration, average) {
+        (Some(duration), Some(average)) if average.as_secs() > 0 => {
+            let episodes = (duration.as_secs() + average.as_secs() / 2) / average.as_secs();
+            usize::try_from(episodes.max(1)).unwrap_or(1)
+        }
+        _ => 1,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -746,6 +818,7 @@ fn identify(path: &PathBuf, dest: &Destinations) -> Result<()> {
 
     let episodes = packrat_core::meta::episodes(show.id).context("fetching episodes")?;
     let preferred = preferred_titles(&disc);
+    let hints = disc_episode_hints(&episodes, season, &disc, &preferred, label.disc);
 
     for number in preferred {
         let Some(title) = disc.titles.iter().find(|t| t.number == number) else {
@@ -756,7 +829,7 @@ fn identify(path: &PathBuf, dest: &Destinations) -> Result<()> {
             continue;
         }
         let durations: Vec<Duration> = segments.iter().map(|s| s.duration).collect();
-        let matched = match_episodes(&episodes, season, &durations);
+        let matched = match_episodes(&episodes, season, &durations, hints.get(&number).copied());
         println!("\nTitle {} -> {} episode(s):", number, matched.len());
         for m in &matched {
             let out = episode_file_in(
@@ -893,5 +966,104 @@ fn fmt_duration(d: Option<Duration>) -> String {
             format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
         }
         None => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(number: u32, runtime_minutes: u32) -> Episode {
+        Episode {
+            id: number,
+            name: Some(format!("Episode {number}")),
+            season: 1,
+            number: Some(number),
+            runtime: Some(runtime_minutes),
+        }
+    }
+
+    fn whole_title(number: u16, minutes: u64) -> Title {
+        Title {
+            number,
+            vts: 1,
+            vts_ttn: number as u8,
+            angles: 1,
+            chapters: 1,
+            duration: Some(Duration::from_secs(minutes * 60)),
+            chapter_durations: vec![Duration::from_secs(minutes * 60)],
+        }
+    }
+
+    fn disc_with(titles: Vec<Title>) -> DiscModel {
+        DiscModel {
+            volume_id: "TEST_S1_D2".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles,
+        }
+    }
+
+    #[test]
+    fn estimates_episodes_from_the_average_runtime() {
+        assert_eq!(
+            estimated_episodes(
+                Some(Duration::from_secs(48 * 60)),
+                Some(Duration::from_secs(24 * 60))
+            ),
+            2
+        );
+        assert_eq!(
+            estimated_episodes(
+                Some(Duration::from_secs(24 * 60)),
+                Some(Duration::from_secs(24 * 60))
+            ),
+            1
+        );
+        assert_eq!(
+            estimated_episodes(Some(Duration::from_secs(30 * 60)), None),
+            1
+        );
+    }
+
+    #[test]
+    fn second_disc_hints_continue_after_the_first_disc() {
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        // Six separate per-episode titles, so each disc is estimated at six.
+        let titles: Vec<Title> = (1..=6).map(|n| whole_title(n, 24)).collect();
+        let disc = disc_with(titles);
+        let preferred = vec![1, 2, 3, 4, 5, 6];
+
+        let hints = disc_episode_hints(&episodes, 1, &disc, &preferred, Some(2));
+        let starts: Vec<usize> = preferred.iter().map(|n| hints[n]).collect();
+        assert_eq!(starts, vec![6, 7, 8, 9, 10, 11]);
+
+        // Those hints place every file on the matching second-disc episode.
+        let numbers: Vec<u16> = preferred
+            .iter()
+            .filter_map(|n| {
+                let title = disc.titles.iter().find(|t| t.number == *n)?;
+                let span = match_span(
+                    &episodes,
+                    1,
+                    title.duration.unwrap_or_default(),
+                    hints.get(n).copied(),
+                )?;
+                Some(span.first)
+            })
+            .collect();
+        assert_eq!(numbers, vec![7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn first_disc_starts_at_episode_one() {
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        let titles: Vec<Title> = (1..=6).map(|n| whole_title(n, 24)).collect();
+        let disc = disc_with(titles);
+        let preferred = vec![1, 2, 3, 4, 5, 6];
+
+        let hints = disc_episode_hints(&episodes, 1, &disc, &preferred, Some(1));
+        assert_eq!(hints[&1], 0);
+        assert_eq!(hints[&6], 5);
     }
 }

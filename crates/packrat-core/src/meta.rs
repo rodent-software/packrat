@@ -10,6 +10,14 @@ use serde::Deserialize;
 
 const TVMAZE: &str = "https://api.tvmaze.com";
 
+/// Runtime slack, per disc segment, that still counts as a tie when a disc
+/// start hint is available. TVmaze frequently reports the same (or nearly the
+/// same) runtime for every episode, so without slack the runtime score can
+/// nudge a later disc back to episode 1.
+const HINT_TIE_SECONDS_PER_SEGMENT: u64 = 3 * 60;
+/// Relative runtime slack for whole-file span matching.
+const SPAN_TIE_MARGIN: f64 = 0.05;
+
 /// Anything that can go wrong talking to a metadata provider.
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -95,12 +103,16 @@ pub fn episodes(show_id: u32) -> Result<Vec<Episode>, MetaError> {
 /// `episodes` in `season`.
 ///
 /// Runtimes choose the window, so a disc 2 whose episodes start at number 8
-/// lands on the right offset; if no runtimes are available we fall back to
-/// start-of-season order.
+/// lands on the right offset. `start_hint` is a 0-based index into the season
+/// guessed from the disc number; it is used directly when no runtimes are
+/// available, and otherwise settles windows whose runtimes match within
+/// `HINT_TIE_SECONDS_PER_SEGMENT`, so a later disc does not restart at
+/// episode 1.
 pub fn match_episodes(
     episodes: &[Episode],
     season: u16,
     segments: &[Duration],
+    start_hint: Option<usize>,
 ) -> Vec<EpisodeMatch> {
     let mut season_episodes: Vec<&Episode> = episodes
         .iter()
@@ -118,11 +130,11 @@ pub fn match_episodes(
             .map(|m| Duration::from_secs(u64::from(m) * 60))
     };
 
-    let offset = if segments.len() >= season_episodes.len() {
-        0
-    } else {
-        let mut best = (0usize, u64::MAX);
-        for start in 0..=(season_episodes.len() - segments.len()) {
+    let max_start = season_episodes.len().saturating_sub(segments.len());
+    let hint = start_hint.map(|h| h.min(max_start));
+
+    let scores: Vec<Option<u64>> = (0..=max_start)
+        .map(|start| {
             let mut score = 0u64;
             let mut comparable = false;
             for (i, segment) in segments.iter().enumerate() {
@@ -131,11 +143,34 @@ pub fn match_episodes(
                     score += runtime.as_secs().abs_diff(segment.as_secs());
                 }
             }
-            if comparable && score < best.1 {
-                best = (start, score);
-            }
+            comparable.then_some(score)
+        })
+        .collect();
+    let best_score = scores.iter().flatten().min().copied();
+
+    let offset = match (best_score, hint) {
+        // No runtimes anywhere: trust the disc hint, else season start.
+        (None, None) => 0,
+        (None, Some(hint)) => hint,
+        // Without a hint, keep the historical runtime choice (earliest best).
+        (Some(min_score), None) => scores
+            .iter()
+            .position(|score| *score == Some(min_score))
+            .unwrap_or(0),
+        // With a hint, windows within the margin are treated as tied and the
+        // one nearest the disc hint wins. A runtime that clearly disagrees
+        // (beyond the margin) still overrides the hint.
+        (Some(min_score), Some(hint)) => {
+            let margin = HINT_TIE_SECONDS_PER_SEGMENT.saturating_mul(segments.len() as u64);
+            let affordable = min_score.saturating_add(margin);
+            scores
+                .iter()
+                .enumerate()
+                .filter(|(_, score)| score.is_some_and(|score| score <= affordable))
+                .map(|(start, _)| start)
+                .min_by_key(|start| start.abs_diff(hint))
+                .unwrap_or(hint)
         }
-        best.0
     };
 
     segments
@@ -167,8 +202,15 @@ pub struct EpisodeSpan {
 /// Best span of consecutive episodes whose combined runtime matches `segment`.
 ///
 /// Used when a disc delivers several episodes in one file, so it can be named
-/// `sXXeYY-eZZ` the way Plex expects.
-pub fn match_span(episodes: &[Episode], season: u16, segment: Duration) -> Option<EpisodeSpan> {
+/// `sXXeYY-eZZ` the way Plex expects. `start_hint` is a 0-based season index
+/// guessed from the disc number and broken the same way as
+/// [`match_episodes`].
+pub fn match_span(
+    episodes: &[Episode],
+    season: u16,
+    segment: Duration,
+    start_hint: Option<usize>,
+) -> Option<EpisodeSpan> {
     let mut season_episodes: Vec<&Episode> = episodes
         .iter()
         .filter(|e| e.season == u32::from(season))
@@ -179,7 +221,8 @@ pub fn match_span(episodes: &[Episode], season: u16, segment: Duration) -> Optio
     }
 
     let target = segment.as_secs_f64().max(1.0);
-    let mut best: Option<(f64, usize, usize)> = None; // (error, start, end-exclusive)
+    // (error, start, end-exclusive) for every candidate span.
+    let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
 
     for start in 0..season_episodes.len() {
         let mut sum = 0.0f64;
@@ -192,14 +235,39 @@ pub fn match_span(episodes: &[Episode], season: u16, segment: Duration) -> Optio
                 break;
             }
             let error = ((sum - target) / target).abs();
-            if best.map_or(true, |(best_error, _, _)| error < best_error) {
-                best = Some((error, start, end + 1));
-            }
+            candidates.push((error, start, end + 1));
         }
     }
 
-    let (error, start, end) = best?;
-    if error > 0.15 || end <= start {
+    let best_error = candidates
+        .iter()
+        .map(|(error, _, _)| *error)
+        .fold(f64::INFINITY, f64::min);
+    if best_error > 0.15 {
+        return None;
+    }
+
+    let (_, start, end) = match start_hint {
+        Some(hint) => {
+            // Runtimes within the tie margin are equally plausible; choose the
+            // span that starts nearest the disc hint.
+            let affordable = best_error + SPAN_TIE_MARGIN;
+            candidates
+                .iter()
+                .filter(|(error, _, _)| *error <= affordable)
+                .min_by(|a, b| {
+                    a.1.abs_diff(hint)
+                        .cmp(&b.1.abs_diff(hint))
+                        .then(a.0.total_cmp(&b.0))
+                })
+                .copied()?
+        }
+        None => candidates
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))?,
+    };
+
+    if end <= start {
         return None;
     }
 
@@ -261,9 +329,79 @@ mod tests {
             .map(|m| Duration::from_secs(u64::from(*m) * 60))
             .collect();
 
-        let matched = match_episodes(&episodes, 1, &segments);
+        let matched = match_episodes(&episodes, 1, &segments, None);
         let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
         assert_eq!(numbers, vec![8, 9, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn disc_hint_wins_when_every_episode_has_the_same_runtime() {
+        // A 12-episode season where TVmaze lists one runtime for every
+        // episode: the runtime score is identical for every window, so only
+        // the disc-derived hint can place disc 2 at episodes 7..=12.
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        let segments: Vec<Duration> = (0..6).map(|_| Duration::from_secs(24 * 60)).collect();
+
+        let matched = match_episodes(&episodes, 1, &segments, Some(6));
+        let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn disc_hint_replaces_the_start_of_season_fallback_without_runtimes() {
+        let episodes: Vec<Episode> = (1..=12)
+            .map(|n| Episode {
+                runtime: None,
+                ..episode(n, 0)
+            })
+            .collect();
+        let segments: Vec<Duration> = (0..6).map(|_| Duration::from_secs(1440)).collect();
+
+        let matched = match_episodes(&episodes, 1, &segments, Some(6));
+        let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn runtime_still_beats_a_wrong_hint() {
+        // The hint wrongly says this disc starts at episode 1, but the
+        // distinctive 40/41-minute runtimes place it at episodes 7..=8, which
+        // must win.
+        let mut runtimes = [24u32; 8];
+        runtimes[6] = 40;
+        runtimes[7] = 41;
+        let episodes: Vec<Episode> = runtimes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| episode(i as u32 + 1, *r))
+            .collect();
+        let segments = [Duration::from_secs(40 * 60), Duration::from_secs(41 * 60)];
+
+        let matched = match_episodes(&episodes, 1, &segments, Some(0));
+        let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![7, 8]);
+    }
+
+    #[test]
+    fn disc_hint_wins_over_near_equal_runtimes() {
+        // Episode runtimes differ by only a minute, so the wrong window (off by
+        // one disc) scores marginally better; within the tie margin the disc
+        // hint must still win.
+        let runtimes = [24u32, 25, 24, 25, 24, 25, 23, 24, 23, 24, 23, 24];
+        let episodes: Vec<Episode> = runtimes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| episode(i as u32 + 1, *r))
+            .collect();
+        let segments: Vec<Duration> = [24u32, 25, 24, 25, 24, 25]
+            .iter()
+            .map(|m| Duration::from_secs(u64::from(*m) * 60))
+            .collect();
+
+        // Window 0 matches exactly, but this is disc 2, so it starts at 6.
+        let matched = match_episodes(&episodes, 1, &segments, Some(6));
+        let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![7, 8, 9, 10, 11, 12]);
     }
 
     #[test]
@@ -276,7 +414,7 @@ mod tests {
             .collect();
         let segments: Vec<Duration> = (0..3).map(|_| Duration::from_secs(1440)).collect();
 
-        let matched = match_episodes(&episodes, 1, &segments);
+        let matched = match_episodes(&episodes, 1, &segments, None);
         let numbers: Vec<u16> = matched.iter().map(|m| m.number).collect();
         assert_eq!(numbers, vec![1, 2, 3]);
     }
@@ -288,7 +426,7 @@ mod tests {
             season: 2,
             ..episode(1, 24)
         });
-        let matched = match_episodes(&episodes, 1, &[Duration::from_secs(1440)]);
+        let matched = match_episodes(&episodes, 1, &[Duration::from_secs(1440)], None);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].number, 1);
     }
@@ -297,7 +435,7 @@ mod tests {
     fn matches_a_two_episode_span() {
         let episodes: Vec<Episode> = (1..=6).map(|n| episode(n, 24)).collect();
         // A 48-minute file is two 24-minute episodes.
-        let span = match_span(&episodes, 1, Duration::from_secs(48 * 60)).expect("span");
+        let span = match_span(&episodes, 1, Duration::from_secs(48 * 60), None).expect("span");
         assert_eq!((span.first, span.last), (1, 2));
         assert_eq!(span.title, None);
     }
@@ -305,9 +443,36 @@ mod tests {
     #[test]
     fn matches_a_single_episode_span_with_title() {
         let episodes: Vec<Episode> = (1..=6).map(|n| episode(n, 24)).collect();
-        let span = match_span(&episodes, 1, Duration::from_secs(24 * 60)).expect("span");
+        let span = match_span(&episodes, 1, Duration::from_secs(24 * 60), None).expect("span");
         assert_eq!((span.first, span.last), (1, 1));
         assert_eq!(span.title.as_deref(), Some("Episode 1"));
+    }
+
+    #[test]
+    fn span_uses_the_disc_hint_when_runtimes_tie() {
+        // Every episode is 24 minutes, so every single-episode span scores
+        // equally; the hint places disc 2's first file at episode 7.
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        let span = match_span(&episodes, 1, Duration::from_secs(24 * 60), Some(6)).expect("span");
+        assert_eq!((span.first, span.last), (7, 7));
+    }
+
+    #[test]
+    fn span_hint_covers_a_multi_episode_file() {
+        let episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        let span = match_span(&episodes, 1, Duration::from_secs(48 * 60), Some(6)).expect("span");
+        assert_eq!((span.first, span.last), (7, 8));
+    }
+
+    #[test]
+    fn span_hint_wins_over_near_equal_runtimes() {
+        // Episode 1 matches the file's 24 minutes exactly, but episode 7 is
+        // only a minute off; within the tie margin the hint still wins.
+        let mut episodes: Vec<Episode> = (1..=12).map(|n| episode(n, 24)).collect();
+        episodes[6].runtime = Some(25);
+
+        let span = match_span(&episodes, 1, Duration::from_secs(24 * 60), Some(6)).expect("span");
+        assert_eq!((span.first, span.last), (7, 7));
     }
 
     #[test]
@@ -318,6 +483,6 @@ mod tests {
                 ..episode(n, 0)
             })
             .collect();
-        assert!(match_span(&episodes, 1, Duration::from_secs(48 * 60)).is_none());
+        assert!(match_span(&episodes, 1, Duration::from_secs(48 * 60), None).is_none());
     }
 }

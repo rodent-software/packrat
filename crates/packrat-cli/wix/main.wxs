@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='Command-line interface for packrat'
+            Description='A free and open source physical media backup utility'
             Manufacturer='packrat contributors'
             InstallerVersion='450'
             Languages='1033'

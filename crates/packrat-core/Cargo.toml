@@ -1,6 +1,6 @@
 [package]
 name = "packrat-core"
-description = "Core disc-reading, detection and ripping logic for packrat"
+description = "A free and open source physical media backup utility"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

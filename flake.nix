@@ -1,5 +1,5 @@
 {
-  description = "packrat — back up physical media into a Plex-compatible library";
+  description = "A free and open source physical media backup utility";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -28,7 +28,7 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "Back up DVDs into a Plex-compatible library";
+            description = "A free and open source physical media backup utility";
             homepage = "https://github.com/rodent-software/packrat";
             license = licenses.gpl3Plus;
             mainProgram = "packrat";

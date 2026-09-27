@@ -20,11 +20,7 @@ maintainer: packrat contributors
 vendor: rodent-software
 homepage: https://github.com/rodent-software/packrat
 license: GPL-3.0-or-later
-description: |
-  A free and open source physical media backup utility.
-
-  Back up DVDs into a Plex-compatible library. CSS-encrypted discs are read
-  through a libdvdcss that the user supplies; it is never bundled.
+description: A free and open source physical media backup utility
 contents:
   - src: target/nfpm/packrat
     dst: /usr/bin/packrat

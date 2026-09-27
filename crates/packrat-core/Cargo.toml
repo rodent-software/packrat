@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 thiserror.workspace = true
@@ -16,6 +19,5 @@ serde_json.workspace = true
 ureq.workspace = true
 strsim.workspace = true
 
-[features]
-# Link libdvdcss for CSS decryption on raw optical devices.
-dvdcss = []
+# libdvdcss is loaded at runtime by the user's own copy, never linked here.
+libloading.workspace = true

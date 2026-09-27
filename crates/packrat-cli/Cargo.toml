@@ -1,10 +1,19 @@
 [package]
-name = "packrat-cli"
+name = "packrat"
 description = "Command-line interface for packrat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "B6270B47-DE00-4D0E-95CB-5D56E4E0DEE5"
+path-guid = "FF8D58ED-DF85-46B6-96B6-90E9966E689C"
+license = false
+eula = false
 
 [[bin]]
 name = "packrat"
@@ -17,7 +26,3 @@ clap.workspace = true
 ratatui.workspace = true
 signal-hook.workspace = true
 fs4.workspace = true
-
-[features]
-# Enable libdvdcss-backed CSS decryption for raw devices.
-dvdcss = ["packrat-core/dvdcss"]

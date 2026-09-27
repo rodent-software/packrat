@@ -8,7 +8,6 @@ pub mod detect;
 pub mod device;
 pub mod disc;
 pub mod drives;
-#[cfg(feature = "dvdcss")]
 pub mod dvdcss;
 pub mod error;
 pub mod identify;

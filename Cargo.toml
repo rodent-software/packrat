@@ -7,6 +7,9 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 rust-version = "1.80"
+authors = ["packrat contributors"]
+repository = "https://github.com/rodent-software/packrat"
+homepage = "https://rodent-software.github.io/packrat/"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -21,6 +24,8 @@ ratatui = "0.29"
 signal-hook = "0.3"
 # Cross-platform free/total space on the destination volume.
 fs4 = { version = "1", features = ["sync"] }
+# Runtime loading of the user-supplied libdvdcss (never linked or bundled).
+libloading = "0.8"
 
 # Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
 oxideav-dvd = "0.0.4"
@@ -33,3 +38,8 @@ oxideav-core = "0.1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

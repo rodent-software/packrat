@@ -2,9 +2,9 @@
 //!
 //! The mounted folder is still used for the IFO structure (filesystem metadata
 //! is never encrypted), but the VOB data is read from the raw device at
-//! absolute LBAs. When the `dvdcss` feature is on, those sector reads go
-//! through libdvdcss so CSS-encrypted discs decrypt transparently; otherwise
-//! the device is read directly, which handles unencrypted discs.
+//! absolute LBAs. When the user has supplied libdvdcss, those sector reads go
+//! through it so CSS-encrypted discs decrypt transparently; without it the
+//! device is read directly, which handles unencrypted discs.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -29,10 +29,9 @@ pub struct DeviceChainReader {
 }
 
 enum Backend {
-    /// Direct device reads, used when the `dvdcss` feature is off.
-    #[allow(dead_code)]
+    /// Direct device reads, used when libdvdcss is not available.
     Plain(File),
-    #[cfg(feature = "dvdcss")]
+    /// Decrypted reads through the user-supplied libdvdcss.
     Dvdcss(crate::dvdcss::Dvdcss),
 }
 
@@ -109,17 +108,18 @@ fn absolute_vts_base(disc: &DvdDisc, partition_start: u64, vts_number: u8) -> Op
 
 impl Backend {
     fn open(device: &Path) -> Result<Self, DiscError> {
-        #[cfg(feature = "dvdcss")]
-        {
-            crate::dvdcss::Dvdcss::open(device).map(Backend::Dvdcss)
-        }
-        #[cfg(not(feature = "dvdcss"))]
-        {
-            let file = File::open(device).map_err(|source| DiscError::Io {
-                path: device.to_path_buf(),
-                source,
-            })?;
-            Ok(Backend::Plain(file))
+        // Prefer the decryption backend. Without libdvdcss, fall back to plain
+        // reads, which still serve unencrypted discs; an encrypted disc then
+        // fails on its scrambled sectors rather than failing to open at all.
+        match crate::dvdcss::Dvdcss::open(device) {
+            Ok(css) => Ok(Backend::Dvdcss(css)),
+            Err(_) => {
+                let file = File::open(device).map_err(|source| DiscError::Io {
+                    path: device.to_path_buf(),
+                    source,
+                })?;
+                Ok(Backend::Plain(file))
+            }
         }
     }
 
@@ -129,7 +129,6 @@ impl Backend {
                 file.seek(SeekFrom::Start(lba * SECTOR as u64))?;
                 file.read_exact(buf)
             }
-            #[cfg(feature = "dvdcss")]
             Backend::Dvdcss(css) => css.read_sector(lba, buf).map_err(io::Error::other),
         }
     }

@@ -98,9 +98,11 @@ mid-read.
 
 ## Encrypted discs
 
-CSS-encrypted discs need `--features dvdcss` at build time (see
-[Development](development.md)). Read the VOB data from the raw device while
-using the mount for the IFO structure:
+CSS-encrypted discs need `libdvdcss`, which packrat loads at runtime from the
+copy you install — it is never bundled. [Installation](installation.md)
+explains why and how to get it on each platform, and `packrat doctor` reports
+whether it was found. Read the VOB data from the raw device while using the
+mount for the IFO structure:
 
 ```sh
 packrat split /run/media/$USER/DVD_LABEL --device /dev/sr0 \

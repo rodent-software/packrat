@@ -99,7 +99,7 @@ pub fn remux_chapters(
 }
 
 /// Remux from whichever medium the source represents: the mounted folder or
-/// the raw device (decrypted through libdvdcss when that feature is enabled).
+/// the raw device (decrypted through the user-supplied libdvdcss when present).
 pub fn remux_chain(
     source: &DiscSource,
     vts: &VtsIfo,

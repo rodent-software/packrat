@@ -4,6 +4,9 @@ A free and open source physical media backup utility.
 
 ![The packrat interactive guide](assets/preview.png)
 
+New here? [Installation](installation.md) covers every platform, and explains
+how to enable CSS decryption for encrypted discs.
+
 ## Quick start
 
 ```sh

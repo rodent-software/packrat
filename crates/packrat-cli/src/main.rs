@@ -160,6 +160,9 @@ enum Command {
     /// List optical drives and any disc in them.
     #[command(after_help = "Examples:\n  packrat drives")]
     Drives,
+    /// Check the environment, including CSS decryption support.
+    #[command(after_help = "Examples:\n  packrat doctor")]
+    Doctor,
     /// Watch for a disc and back it up when one appears.
     #[command(
         after_help = "Examples:\n  packrat watch --library /mnt/media --include-extras\n  packrat watch --once --dry-run --library /mnt/media\n  packrat watch --device /dev/sr1 --library /mnt/media"
@@ -257,6 +260,7 @@ fn main() -> Result<()> {
             identify(&path, &dest, first_episode)
         }
         Some(Command::Drives) => drives(),
+        Some(Command::Doctor) => doctor(),
         Some(Command::Watch {
             library,
             tv_dir,
@@ -315,6 +319,9 @@ fn open(path: &PathBuf) -> Result<(DiscSource, DiscModel)> {
 /// Open a disc, optionally reading VOB data from a raw device while using the
 /// mounted `path` for IFO structure.
 fn open_with_device(path: &PathBuf, device: Option<&Path>) -> Result<(DiscSource, DiscModel)> {
+    if device.is_some() {
+        warn_if_no_dvdcss();
+    }
     let source = match device {
         Some(dev) => DiscSource::discover_device(dev, path),
         None => DiscSource::discover(path),
@@ -322,6 +329,50 @@ fn open_with_device(path: &PathBuf, device: Option<&Path>) -> Result<(DiscSource
     .with_context(|| format!("opening disc at {}", path.display()))?;
     let disc = read_disc(&source).with_context(|| "reading disc structure")?;
     Ok((source, disc))
+}
+
+/// Warn once per process when a raw device is used but libdvdcss is missing.
+fn warn_if_no_dvdcss() {
+    use std::sync::OnceLock;
+
+    static WARNED: OnceLock<()> = OnceLock::new();
+    if WARNED.get().is_some() {
+        return;
+    }
+    if packrat_core::dvdcss::status().is_available() {
+        return;
+    }
+    WARNED.set(()).ok();
+    eprintln!(
+        "warning: libdvdcss was not found, so CSS-encrypted discs cannot be read \
+         from the raw device. Run `packrat doctor` for how to install it."
+    );
+}
+
+/// Report the environment packrat depends on.
+fn doctor() -> Result<()> {
+    println!("packrat  : {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "platform : {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    match packrat_core::dvdcss::status() {
+        packrat_core::dvdcss::DvdcssStatus::Available { path } => {
+            println!("css      : available");
+            println!("libdvdcss: {}", path.display());
+        }
+        packrat_core::dvdcss::DvdcssStatus::Unavailable { reason } => {
+            println!("css      : unavailable");
+            println!("reason   : {reason}");
+            println!();
+            println!("Rips of unencrypted discs work without libdvdcss. To read");
+            println!("CSS-encrypted discs, install it for your platform or set");
+            println!("PACKRAT_DVDCSS to its path. See docs/installation.md.");
+        }
+    }
+    Ok(())
 }
 
 fn probe(path: &PathBuf) -> Result<()> {

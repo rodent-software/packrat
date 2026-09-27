@@ -24,6 +24,11 @@ pub enum DiscError {
     #[error("remux failed: {0}")]
     Remux(String),
 
+    /// libdvdcss is needed but could not be loaded; the string explains why
+    /// and how to supply it.
+    #[error("CSS decryption unavailable: {0}")]
+    Dvdcss(String),
+
     /// The caller asked the remux to stop; any half-written output is removed.
     #[error("remux cancelled")]
     Cancelled,

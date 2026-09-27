@@ -57,7 +57,7 @@ impl DiscSource {
     }
 
     /// Build a device-backed source: `device` is read for VOB sectors (through
-    /// libdvdcss when the feature is enabled) and `mount` supplies the IFO
+    /// libdvdcss when the user has supplied it) and `mount` supplies the IFO
     /// structure.
     pub fn discover_device(
         device: impl AsRef<Path>,

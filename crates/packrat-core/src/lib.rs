@@ -35,7 +35,7 @@ pub use meta::{
     match_episodes, match_span, search_show, Episode, EpisodeMatch, EpisodeSpan, MetaError, Show,
 };
 pub use remux::{
-    remux_chain, remux_chain_with_progress, remux_chapters, remux_chapters_with_reader,
-    remux_title, RemuxPhase, RemuxProgress, RemuxReport,
+    remux_chain, remux_chain_with_progress, remux_chain_with_progress_and_cancel, remux_chapters,
+    remux_chapters_with_reader, remux_title, RemuxPhase, RemuxProgress, RemuxReport,
 };
 pub use source::DiscSource;

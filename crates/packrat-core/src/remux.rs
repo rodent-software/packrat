@@ -9,11 +9,10 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use oxideav_core::packet::PacketFlags;
-use oxideav_core::{
-    CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek,
-};
+use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek};
 use oxideav_dvd::vob::{
     looks_like_nav_pack, DvdSubstream, NavPack, PackHeader, PesPacket, AUDIO_SUBSTREAM_HEADER_LEN,
     SC_PADDING_STREAM, SC_PRIVATE_STREAM_1, SC_PRIVATE_STREAM_2, SC_SYSTEM_HEADER,
@@ -117,16 +116,75 @@ pub fn remux_chain_with_progress(
     out: &Path,
     progress: &mut dyn FnMut(RemuxProgress),
 ) -> Result<RemuxReport, DiscError> {
+    remux_chain_impl(source, vts, title, first, last, out, progress, None)
+}
+
+/// Like [`remux_chain_with_progress`], but stops as soon as `cancel` is set.
+///
+/// The flag is checked per VOB sector, so cancellation lands within a disk
+/// read. Any half-written `.partial` output is removed before
+/// [`DiscError::Cancelled`] is returned, so an aborted rip leaves no file for
+/// a media server to index.
+#[allow(clippy::too_many_arguments)]
+pub fn remux_chain_with_progress_and_cancel(
+    source: &DiscSource,
+    vts: &VtsIfo,
+    title: &Title,
+    first: u16,
+    last: u16,
+    out: &Path,
+    progress: &mut dyn FnMut(RemuxProgress),
+    cancel: &AtomicBool,
+) -> Result<RemuxReport, DiscError> {
+    remux_chain_impl(source, vts, title, first, last, out, progress, Some(cancel))
+}
+
+/// Build the right reader for the source and run the remux, passing the
+/// optional cancellation flag straight through.
+#[allow(clippy::too_many_arguments)]
+fn remux_chain_impl(
+    source: &DiscSource,
+    vts: &VtsIfo,
+    title: &Title,
+    first: u16,
+    last: u16,
+    out: &Path,
+    progress: &mut dyn FnMut(RemuxProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<RemuxReport, DiscError> {
     match source {
         DiscSource::Folder { .. } => {
             let mut reader = VtsChainReader::open(source.video_ts(), title.vts)?;
-            remux_chapters_with_reader_progress(&mut reader, vts, title, first, last, out, progress)
+            remux_chapters_with_reader_progress_cancel(
+                &mut reader,
+                vts,
+                title,
+                first,
+                last,
+                out,
+                progress,
+                cancel,
+            )
         }
         DiscSource::Device { device, .. } => {
             let mut reader = crate::device::DeviceChainReader::open(device, title.vts)?;
-            remux_chapters_with_reader_progress(&mut reader, vts, title, first, last, out, progress)
+            remux_chapters_with_reader_progress_cancel(
+                &mut reader,
+                vts,
+                title,
+                first,
+                last,
+                out,
+                progress,
+                cancel,
+            )
         }
     }
+}
+
+/// True when a cancellation has been requested.
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
 }
 
 /// Like [`remux_chapters`], but over any `Read + Seek` positioned within the
@@ -154,6 +212,24 @@ pub fn remux_chapters_with_reader_progress<R: Read + Seek>(
     out: &Path,
     progress: &mut dyn FnMut(RemuxProgress),
 ) -> Result<RemuxReport, DiscError> {
+    remux_chapters_with_reader_progress_cancel(reader, vts, title, first, last, out, progress, None)
+}
+
+/// The cancel-aware implementation behind the public remux entry points.
+#[allow(clippy::too_many_arguments)]
+fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
+    reader: &mut R,
+    vts: &VtsIfo,
+    title: &Title,
+    first: u16,
+    last: u16,
+    out: &Path,
+    progress: &mut dyn FnMut(RemuxProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<RemuxReport, DiscError> {
+    if cancelled(cancel) {
+        return Err(DiscError::Cancelled);
+    }
     let dvd_title = vts
         .titles
         .iter()
@@ -219,7 +295,11 @@ pub fn remux_chapters_with_reader_progress<R: Read + Seek>(
                 Ok(())
             },
             &mut on_sectors,
+            cancel,
         )?;
+    }
+    if cancelled(cancel) {
+        return Err(DiscError::Cancelled);
     }
     if tracks.is_empty() {
         return Err(DiscError::Remux("title has no playable streams".into()));
@@ -375,6 +455,7 @@ pub fn remux_chapters_with_reader_progress<R: Read + Seek>(
             Ok(())
         },
         &mut on_sectors,
+        cancel,
     )?;
 
     // Flush the final frame each assembler is still holding.
@@ -617,13 +698,7 @@ struct GopPicture {
 }
 
 impl VideoAssembler {
-    fn push(
-        &mut self,
-        data: &[u8],
-        pts: Option<u64>,
-        _dts: Option<u64>,
-        out: &mut Vec<Unit>,
-    ) {
+    fn push(&mut self, data: &[u8], pts: Option<u64>, _dts: Option<u64>, out: &mut Vec<Unit>) {
         self.buf.extend_from_slice(data);
         // Rescan a few bytes back so a start code split across PES packets is
         // still found.
@@ -1045,14 +1120,19 @@ fn codec_parameters(track: Track) -> CodecParameters {
 
 /// Call `f` for every PES packet across the selected chapters. `on_sectors` is
 /// invoked with the number of sectors just read, so callers can track progress.
+/// Returns [`DiscError::Cancelled`] as soon as `cancel` is set.
 fn for_each_pes<R: Read + Seek>(
     reader: &mut R,
     vts: &VtsIfo,
     chapters: &[(u16, DvdChapter)],
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), DiscError> {
     for (number, chapter) in chapters {
+        if cancelled(cancel) {
+            return Err(DiscError::Cancelled);
+        }
         let pgc = vts
             .pgcs
             .get(usize::from(chapter.pgcn).wrapping_sub(1))
@@ -1068,6 +1148,7 @@ fn for_each_pes<R: Read + Seek>(
                 cell.last_vobu_end_sector,
                 f,
                 on_sectors,
+                cancel,
             )?;
         }
     }
@@ -1101,6 +1182,7 @@ fn walk_sectors<R: Read + Seek>(
     last: u32,
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), DiscError> {
     if last < first {
         return Ok(());
@@ -1109,6 +1191,9 @@ fn walk_sectors<R: Read + Seek>(
     let mut buffer = vec![0u8; SECTOR];
 
     for offset in 0..count {
+        if cancelled(cancel) {
+            return Err(DiscError::Cancelled);
+        }
         let sector = u64::from(first) + offset;
         reader
             .seek(SeekFrom::Start(sector * SECTOR as u64))
@@ -1291,10 +1376,42 @@ mod tests {
 
     #[test]
     fn display_aspect_ratio_maps_dvd_codes() {
-        assert_eq!(display_aspect_ratio(AspectRatioCode::Ratio4x3), Some((4, 3)));
-        assert_eq!(display_aspect_ratio(AspectRatioCode::Ratio16x9), Some((16, 9)));
+        assert_eq!(
+            display_aspect_ratio(AspectRatioCode::Ratio4x3),
+            Some((4, 3))
+        );
+        assert_eq!(
+            display_aspect_ratio(AspectRatioCode::Ratio16x9),
+            Some((16, 9))
+        );
         assert_eq!(display_aspect_ratio(AspectRatioCode::Square), None);
         assert_eq!(display_aspect_ratio(AspectRatioCode::Forbidden), None);
+    }
+
+    #[test]
+    fn a_set_cancel_flag_stops_walking_sectors() {
+        let cancel = AtomicBool::new(true);
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut sectors = |_sectors: u64| {};
+
+        let result = walk_sectors(&mut reader, 0, 10, &mut pes, &mut sectors, Some(&cancel));
+
+        assert!(matches!(result, Err(DiscError::Cancelled)));
+    }
+
+    #[test]
+    fn walking_sectors_without_a_cancel_flag_is_not_cancelled() {
+        let cancel = AtomicBool::new(false);
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut sectors = |_sectors: u64| {};
+
+        // Nothing is cancelled, so it gets as far as reading (and failing on
+        // the empty cursor) rather than stopping short.
+        let result = walk_sectors(&mut reader, 0, 0, &mut pes, &mut sectors, Some(&cancel));
+
+        assert!(!matches!(result, Err(DiscError::Cancelled)));
     }
 
     #[test]

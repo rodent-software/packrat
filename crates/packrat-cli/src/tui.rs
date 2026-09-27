@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -23,9 +24,9 @@ use ratatui::{DefaultTerminal, Frame};
 
 use packrat_core::{
     classify, movie_file_in, parse_label, preferred_titles, read_disc, read_vts,
-    remux_chain_with_progress, split_title, Classification, DiscKind, DiscModel, DiscSource,
-    LabelInfo, OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show, Title, EXTRA_MIN,
-    MIN_CONTENT,
+    remux_chain_with_progress_and_cancel, split_title, Classification, DiscError, DiscKind,
+    DiscModel, DiscSource, LabelInfo, OpticalDrive, RemuxPhase, RemuxProgress, RemuxReport, Show,
+    Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 use crate::config::{self, Config};
@@ -75,9 +76,16 @@ fn rat_lines(frame: &'static [&'static str; 3]) -> Vec<Line<'static>> {
     lines
 }
 
-
 /// Launch the interactive flow. Returns once the user quits.
 pub fn run() -> Result<()> {
+    // Ctrl-C sent while the terminal is in raw mode arrives as a key event,
+    // but an external SIGINT/SIGTERM does not. Catch those too so a rip is
+    // stopped and the terminal restored instead of the process just vanishing.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _ = signal_hook::flag::register(signal, Arc::clone(&shutdown));
+    }
+
     // If we panic while the terminal is in raw mode, put it back first.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -86,8 +94,11 @@ pub fn run() -> Result<()> {
     }));
 
     let mut terminal = ratatui::init();
-    let mut app = App::new();
+    let mut app = App::new(shutdown);
     let result = app.event_loop(&mut terminal);
+    // Last-resort cleanup if the loop bailed out with `?`: stop and join any
+    // rip worker before the terminal is restored.
+    app.finish_rip();
     ratatui::restore();
     result
 }
@@ -147,6 +158,7 @@ enum JobStatus {
     Running,
     Done(RemuxReport),
     Failed(String),
+    Cancelled,
 }
 
 /// One planned output file.
@@ -294,7 +306,14 @@ struct App {
     stage: Stage,
     tx: Sender<WorkerEvent>,
     rx: Receiver<WorkerEvent>,
+    /// Set to stop after the file currently being written (soft cancel).
     cancel: Arc<AtomicBool>,
+    /// Set to stop the file currently being written immediately (hard abort).
+    abort: Arc<AtomicBool>,
+    /// Set by the SIGINT/SIGTERM handler to request a graceful exit.
+    shutdown: Arc<AtomicBool>,
+    /// The rip worker, joined on exit so a cancelled file is cleaned up.
+    rip_handle: Option<JoinHandle<()>>,
     tick: usize,
 
     // Disc detection
@@ -343,8 +362,9 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(shutdown: Arc<AtomicBool>) -> Self {
         let mut app = Self::initial();
+        app.shutdown = shutdown;
         app.begin_detection(true);
         app
     }
@@ -361,6 +381,9 @@ impl App {
             tx,
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
+            abort: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            rip_handle: None,
             tick: 0,
             detect_loading: false,
             scan_in_flight: false,
@@ -407,6 +430,11 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
+            if self.shutdown.load(Ordering::Relaxed) {
+                self.request_shutdown();
+                break;
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -426,7 +454,29 @@ impl App {
 
             self.tick = self.tick.wrapping_add(1);
         }
+        // Stop a running rip and wait for it to remove its `.partial` output
+        // before the terminal (and process) go away.
+        self.finish_rip();
         Ok(())
+    }
+
+    /// Ask a running rip to stop immediately and leave the guide.
+    fn request_shutdown(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.abort.store(true, Ordering::Relaxed);
+        self.should_quit = true;
+    }
+
+    /// Wait for the rip worker to finish, cancelling it first if it is still
+    /// running, so no half-written file is left behind.
+    fn finish_rip(&mut self) {
+        if self.rip_handle.is_some() {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.abort.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.rip_handle.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Re-scan for a disc while the user is still configuring, so swapping
@@ -447,7 +497,7 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            self.request_shutdown();
             return;
         }
 
@@ -463,11 +513,17 @@ impl App {
         match self.stage {
             Stage::Detect => self.on_key_detect(key),
             Stage::Plan => self.on_key_plan(key),
-            Stage::Ripping => {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+            Stage::Ripping => match key.code {
+                // Soft cancel: finish the file in progress, then stop.
+                KeyCode::Char('q') | KeyCode::Esc => {
                     self.cancel.store(true, Ordering::Relaxed);
                 }
-            }
+                // Hard abort: stop the file in progress right now.
+                KeyCode::Char('a') => {
+                    self.abort.store(true, Ordering::Relaxed);
+                }
+                _ => {}
+            },
             Stage::Done => match key.code {
                 KeyCode::Char('c') => self.back_to_plan(),
                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char(' ') => {
@@ -715,6 +771,9 @@ impl App {
             return;
         };
 
+        // Reap a previous run so its thread cannot outlive a new one.
+        self.finish_rip();
+
         for job in &mut self.jobs {
             job.status = JobStatus::Pending;
         }
@@ -725,6 +784,7 @@ impl App {
         self.current = None;
         self.stage = Stage::Ripping;
         self.cancel.store(false, Ordering::Relaxed);
+        self.abort.store(false, Ordering::Relaxed);
 
         let jobs: Vec<RipJob> = selected
             .iter()
@@ -739,7 +799,14 @@ impl App {
                 }
             })
             .collect();
-        spawn_rip(self.tx.clone(), self.cancel.clone(), source, disc, jobs);
+        self.rip_handle = Some(spawn_rip(
+            self.tx.clone(),
+            self.cancel.clone(),
+            self.abort.clone(),
+            source,
+            disc,
+            jobs,
+        ));
     }
 
     /// Return from the result screen to the configure screen, keeping the
@@ -766,9 +833,7 @@ impl App {
         if self.stage == Stage::Ripping
             && matches!(
                 &event,
-                WorkerEvent::DiscReady { .. }
-                    | WorkerEvent::NoDisc(_)
-                    | WorkerEvent::DiscError(_)
+                WorkerEvent::DiscReady { .. } | WorkerEvent::NoDisc(_) | WorkerEvent::DiscError(_)
             )
         {
             self.detect_loading = false;
@@ -880,8 +945,20 @@ impl App {
                 }
             }
             WorkerEvent::RipDone { cancelled } => {
+                if cancelled {
+                    // The file in flight was cut short; mark it so the result
+                    // screen does not leave a spinner where a write stopped.
+                    for job in &mut self.jobs {
+                        if matches!(job.status, JobStatus::Running) {
+                            job.status = JobStatus::Cancelled;
+                        }
+                    }
+                }
                 self.cancelled = cancelled;
                 self.stage = Stage::Done;
+                // The worker has sent its last event; join so a cancelled
+                // `.partial` file is gone before the result screen appears.
+                self.finish_rip();
             }
         }
     }
@@ -930,20 +1007,13 @@ impl App {
             }
             Stage::Plan => {
                 const CYCLE: [&[&str; 3]; 8] = [
-                    &RAT_IDLE,
-                    &RAT_IDLE,
-                    &RAT_BLINK,
-                    &RAT_IDLE,
-                    &RAT_IDLE,
-                    &RAT_IDLE,
-                    &RAT_EAR,
+                    &RAT_IDLE, &RAT_IDLE, &RAT_BLINK, &RAT_IDLE, &RAT_IDLE, &RAT_IDLE, &RAT_EAR,
                     &RAT_IDLE,
                 ];
                 CYCLE[(self.tick / 3) % CYCLE.len()]
             }
             Stage::Ripping => {
-                const CYCLE: [&[&str; 3]; 4] =
-                    [&RAT_PACK, &RAT_PACK, &RAT_PACK_BLINK, &RAT_PACK];
+                const CYCLE: [&[&str; 3]; 4] = [&RAT_PACK, &RAT_PACK, &RAT_PACK_BLINK, &RAT_PACK];
                 CYCLE[(self.tick / 3) % CYCLE.len()]
             }
             Stage::Done => {
@@ -1030,7 +1100,7 @@ impl App {
                 ("?", "help"),
                 ("q", "quit"),
             ],
-            Stage::Ripping => &[("q", "cancel after this file")],
+            Stage::Ripping => &[("q", "stop after this file"), ("a", "abort now")],
             Stage::Done => &[("c", "configure another"), ("Enter", "quit")],
         };
         let mut spans = vec![Span::raw(" ")];
@@ -1305,7 +1375,9 @@ impl App {
         } else {
             ((finished as f64 + metrics.file_fraction) / self.total as f64).clamp(0.0, 1.0)
         };
-        let note = if self.cancel.load(Ordering::Relaxed) {
+        let note = if self.abort.load(Ordering::Relaxed) {
+            "  aborting…"
+        } else if self.cancel.load(Ordering::Relaxed) {
             "  cancelling…"
         } else {
             ""
@@ -1482,6 +1554,7 @@ impl App {
                 Style::default().fg(Color::Green),
             ),
             JobStatus::Failed(e) => Span::styled(format!("✗ {e}"), Style::default().fg(Color::Red)),
+            JobStatus::Cancelled => Span::styled("⊘ cancelled", Style::default().fg(Color::Yellow)),
         };
         Line::from(vec![
             Span::styled(format!("{checkbox} "), Style::default().fg(Color::Cyan)),
@@ -1508,11 +1581,12 @@ impl App {
             Line::from("Tab / Shift+Tab   move between fields"),
             Line::from("↑ / ↓             select a file"),
             Line::from("Space             include / skip a file"),
-            Line::from("a                 include / skip all"),
+            Line::from("a                 include / skip all (plan) · abort now (ripping)"),
             Line::from("e                 include extras"),
             Line::from("Enter             apply the show, season and directories"),
             Line::from("r                 start backing up"),
             Line::from("q / Esc           quit (while ripping: stop after this file)"),
+            Line::from("Ctrl+C            stop now and quit"),
             Line::raw(""),
             Line::from(Span::styled(
                 "Press any key to close",
@@ -1608,13 +1682,16 @@ fn disc_fingerprint(source: &DiscSource, disc: &DiscModel) -> String {
 fn spawn_rip(
     tx: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
     source: DiscSource,
     disc: DiscModel,
     jobs: Vec<RipJob>,
-) {
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         for job in jobs {
-            if cancel.load(Ordering::Relaxed) {
+            // `cancel` stops between files; `abort` also stops the file that
+            // is in progress.
+            if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerEvent::RipDone { cancelled: true });
                 return;
             }
@@ -1641,30 +1718,44 @@ fn spawn_rip(
                             elapsed: started.elapsed(),
                         });
                     };
-                    read_vts(&source, title.vts)
-                        .and_then(|vts| {
-                            remux_chain_with_progress(
-                                &source,
-                                &vts,
-                                title,
-                                job.first,
-                                job.last,
-                                &job.path,
-                                &mut report_progress,
-                            )
-                        })
-                        .map_err(|e| e.to_string())
+                    read_vts(&source, title.vts).and_then(|vts| {
+                        remux_chain_with_progress_and_cancel(
+                            &source,
+                            &vts,
+                            title,
+                            job.first,
+                            job.last,
+                            &job.path,
+                            &mut report_progress,
+                            &abort,
+                        )
+                    })
                 }
-                None => Err(format!("disc has no title {}", job.title)),
+                None => Err(DiscError::Remux(format!("disc has no title {}", job.title))),
             };
 
-            let _ = tx.send(WorkerEvent::JobDone {
-                index: job.index,
-                result: outcome,
-            });
+            // An aborted file is not a failure: the core has already removed
+            // its `.partial`, so report the run as cancelled and stop.
+            match outcome {
+                Err(DiscError::Cancelled) => {
+                    let _ = tx.send(WorkerEvent::RipDone { cancelled: true });
+                    return;
+                }
+                outcome => {
+                    let _ = tx.send(WorkerEvent::JobDone {
+                        index: job.index,
+                        result: outcome.map_err(|e| e.to_string()),
+                    });
+                }
+            }
+
+            if abort.load(Ordering::Relaxed) {
+                let _ = tx.send(WorkerEvent::RipDone { cancelled: true });
+                return;
+            }
         }
         let _ = tx.send(WorkerEvent::RipDone { cancelled: false });
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2055,6 +2146,66 @@ mod tests {
 
         assert!(matches!(app.stage, Stage::Ripping));
         assert!(!app.scan_in_flight);
+    }
+
+    #[test]
+    fn cancel_key_stops_after_the_current_file() {
+        let mut app = App::initial();
+        app.stage = Stage::Ripping;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert!(app.cancel.load(Ordering::Relaxed));
+        assert!(!app.abort.load(Ordering::Relaxed), "q is a soft cancel");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn abort_key_stops_the_current_file_immediately() {
+        let mut app = App::initial();
+        app.stage = Stage::Ripping;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert!(app.abort.load(Ordering::Relaxed));
+        assert!(
+            !app.cancel.load(Ordering::Relaxed),
+            "abort does not need the soft flag"
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_requests_a_graceful_shutdown() {
+        let mut app = App::initial();
+        app.stage = Stage::Ripping;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.should_quit);
+        assert!(app.cancel.load(Ordering::Relaxed));
+        assert!(app.abort.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shutdown_joins_the_rip_worker() {
+        let mut app = App::initial();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let abort = app.abort.clone();
+        let stopped_by_worker = stopped.clone();
+        app.rip_handle = Some(std::thread::spawn(move || {
+            while !abort.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stopped_by_worker.store(true, Ordering::Relaxed);
+        }));
+
+        app.request_shutdown();
+        app.finish_rip();
+
+        assert!(stopped.load(Ordering::Relaxed), "worker was not joined");
+        assert!(app.should_quit);
+        assert!(app.rip_handle.is_none());
     }
 
     #[test]

@@ -23,4 +23,8 @@ pub enum DiscError {
 
     #[error("remux failed: {0}")]
     Remux(String),
+
+    /// The caller asked the remux to stop; any half-written output is removed.
+    #[error("remux cancelled")]
+    Cancelled,
 }

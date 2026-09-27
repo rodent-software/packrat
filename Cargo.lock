@@ -706,6 +706,7 @@ dependencies = [
  "clap",
  "packrat-core",
  "ratatui",
+ "signal-hook",
 ]
 
 [[package]]

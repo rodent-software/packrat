@@ -15,6 +15,7 @@ packrat-core = { path = "../packrat-core" }
 anyhow.workspace = true
 clap.workspace = true
 ratatui.workspace = true
+signal-hook.workspace = true
 
 [features]
 # Enable libdvdcss-backed CSS decryption for raw devices.

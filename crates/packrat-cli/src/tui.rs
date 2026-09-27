@@ -2764,7 +2764,7 @@ fn load_disc(
     // Only read from a raw device if it can actually be opened. A detected drive
     // whose device node is missing or unreadable still has a usable mount, and
     // falling back to it beats failing the whole disc.
-    let usable_device = device.filter(|dev| std::fs::File::open(dev).is_ok());
+    let usable_device = device.filter(|dev| packrat_core::drives::open_device(dev).is_ok());
     let source = match usable_device {
         Some(dev) => DiscSource::discover_device(dev, path),
         None => DiscSource::discover(path),
@@ -2869,6 +2869,9 @@ fn spawn_rip(
                 return;
             }
         }
+        // Drop the tray lock before the UI sees the result, so the picker can
+        // immediately eject the disc or load another one.
+        drop(_tray);
         let _ = tx.send(WorkerEvent::RipDone { cancelled: false });
     })
 }

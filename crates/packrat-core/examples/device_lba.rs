@@ -13,7 +13,8 @@ fn main() {
         println!("UDF {:?} lba={} size={}", f.kind, f.lba, f.size);
     }
 
-    let file = std::fs::File::open(&device).expect("open device");
+    let file =
+        packrat_core::drives::open_device(std::path::Path::new(&device)).expect("open device");
     let iso = oxideav_dvd::DvdDisc::from_iso9660(file).expect("open device (ISO9660)");
     println!("\nISO volume_id = {}", iso.volume_id);
     for f in iso.video_ts_files.iter().take(5) {

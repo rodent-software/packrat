@@ -26,6 +26,9 @@ signal-hook = "0.3"
 fs4 = { version = "1", features = ["sync"] }
 # Runtime loading of the user-supplied libdvdcss (never linked or bundled).
 libloading = "0.8"
+# O_NONBLOCK for opening optical devices, so probing a drive never closes its
+# open tray via the kernel's autoclose behaviour.
+libc = "0.2"
 
 # Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
 oxideav-dvd = "0.0.4"

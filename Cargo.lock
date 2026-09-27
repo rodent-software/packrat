@@ -740,6 +740,7 @@ dependencies = [
 name = "packrat-core"
 version = "0.1.0-rc.3"
 dependencies = [
+ "libc",
  "libloading",
  "oxideav-core",
  "oxideav-dvd",

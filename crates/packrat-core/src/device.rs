@@ -73,7 +73,7 @@ impl DeviceChainReader {
 fn vts_chain_base_lba(device: &Path, vts_number: u8) -> Result<u64, DiscError> {
     // UDF first: its block addresses are partition-relative, so add the
     // partition start to turn them into absolute disc LBAs.
-    if let Ok(file) = File::open(device) {
+    if let Ok(file) = crate::drives::open_device(device) {
         if let Ok(mut udf) = UdfVolume::open(file) {
             let partition_start = udf.partition_start_sector;
             if let Ok(disc) = DvdDisc::from_udf(&mut udf) {
@@ -86,7 +86,7 @@ fn vts_chain_base_lba(device: &Path, vts_number: u8) -> Result<u64, DiscError> {
 
     // Fall back to the ISO 9660 bridge, whose directory records already carry
     // absolute disc LBAs.
-    let file = File::open(device).map_err(|source| DiscError::Io {
+    let file = crate::drives::open_device(device).map_err(|source| DiscError::Io {
         path: device.to_path_buf(),
         source,
     })?;
@@ -114,7 +114,7 @@ impl Backend {
         match crate::dvdcss::Dvdcss::open(device) {
             Ok(css) => Ok(Backend::Dvdcss(css)),
             Err(_) => {
-                let file = File::open(device).map_err(|source| DiscError::Io {
+                let file = crate::drives::open_device(device).map_err(|source| DiscError::Io {
                     path: device.to_path_buf(),
                     source,
                 })?;

@@ -28,6 +28,37 @@ impl OpticalDrive {
     }
 }
 
+/// Open an optical device for control ioctls without letting the kernel close
+/// an open tray.
+///
+/// Linux's `autoclose` (on by default) closes the tray when `/dev/sr*` is
+/// opened in blocking mode, so a background probe of a drive whose tray the
+/// user just opened would snap it shut. Every open of a raw device goes
+/// through here with `O_NONBLOCK`; block-device reads ignore the flag.
+pub fn open_device(device: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(device)
+}
+
+/// Like [`open_device`], but writable, for the occasional bridge that only
+/// accepts an eject command on a read-write handle.
+pub fn open_device_writable(device: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(device)
+}
+
 /// Holds an optical drive's tray closed for as long as it lives.
 ///
 /// A rip takes one of these so a stray eject cannot interrupt the read; it is
@@ -61,7 +92,7 @@ impl Drop for TrayLock {
 pub fn lock_tray(device: &Path) -> TrayLock {
     #[cfg(target_os = "linux")]
     {
-        let file = std::fs::File::open(device)
+        let file = open_device(device)
             .ok()
             .filter(|file| linux_ioctl(file, CDROM_LOCKDOOR, 1).is_ok());
         TrayLock { file }
@@ -139,25 +170,23 @@ fn linux_eject(device: &Path) -> Result<(), String> {
 
     // Some bridges only accept the command on a read-write handle.
     let candidates = [
-        (
-            "read-only",
-            std::fs::File::open(device).map_err(|e| e.to_string()),
-        ),
+        ("read-only", open_device(device).map_err(|e| e.to_string())),
         (
             "read-write",
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(device)
-                .map_err(|e| e.to_string()),
+            open_device_writable(device).map_err(|e| e.to_string()),
         ),
     ];
     for (access, file) in candidates {
         match file {
-            Ok(file) => match linux_ioctl(&file, CDROMEJECT, 0) {
-                Ok(()) => return Ok(()),
-                Err(e) => reasons.push(format!("CDROMEJECT ({access}): {e}")),
-            },
+            Ok(file) => {
+                // Clear a door lock left behind by a previous run or another
+                // application; the kernel refuses CDROMEJECT while one is set.
+                let _ = linux_ioctl(&file, CDROM_LOCKDOOR, 0);
+                match linux_ioctl(&file, CDROMEJECT, 0) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => reasons.push(format!("CDROMEJECT ({access}): {e}")),
+                }
+            }
             Err(e) => reasons.push(format!("open {access}: {e}")),
         }
     }
@@ -182,7 +211,7 @@ fn linux_eject(device: &Path) -> Result<(), String> {
         .args(["unmount", "-b", &path])
         .output()
     {
-        Ok(output) if output.status.success() => match std::fs::File::open(device) {
+        Ok(output) if output.status.success() => match open_device(device) {
             Ok(file) => match linux_ioctl(&file, CDROMEJECT, 0) {
                 Ok(()) => return Ok(()),
                 Err(e) => reasons.push(format!("CDROMEJECT after udisks unmount: {e}")),
@@ -525,4 +554,22 @@ pub fn list() -> Vec<OpticalDrive> {
 pub fn list() -> Vec<OpticalDrive> {
     // Unsupported platform: report nothing rather than guessing.
     Vec::new()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::path::Path;
+
+    /// The point of [`open_device`] is that the kernel does not autoclose an
+    /// open tray; it only does that for blocking opens, so the flag must be
+    /// set on the file we hand out.
+    #[test]
+    fn open_device_sets_the_nonblocking_flag() {
+        let file = open_device(Path::new("/dev/null")).expect("open /dev/null");
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_ne!(flags & libc::O_NONBLOCK, 0, "O_NONBLOCK was not set");
+    }
 }

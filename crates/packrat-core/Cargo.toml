@@ -21,3 +21,4 @@ strsim.workspace = true
 
 # libdvdcss is loaded at runtime by the user's own copy, never linked here.
 libloading.workspace = true
+libc.workspace = true

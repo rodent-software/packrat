@@ -282,6 +282,7 @@ enum WorkerEvent {
         phase: RemuxPhase,
         bytes_done: u64,
         bytes_total: u64,
+        written_bytes: u64,
         elapsed: Duration,
     },
     JobDone {
@@ -297,9 +298,17 @@ enum WorkerEvent {
 struct ProgressSnapshot {
     index: usize,
     phase: RemuxPhase,
+    /// VOB bytes read from the disc so far, across both passes.
     bytes_done: u64,
+    /// VOB bytes that will be read across both passes.
     bytes_total: u64,
+    /// Bytes written to the output file so far.
+    written_bytes: u64,
     elapsed: Duration,
+    /// Disc read rate over the last progress interval, in bytes per second.
+    read_rate: Option<f64>,
+    /// Output write rate over the last progress interval, in bytes per second.
+    write_rate: Option<f64>,
 }
 
 struct App {
@@ -917,14 +926,35 @@ impl App {
                 phase,
                 bytes_done,
                 bytes_total,
+                written_bytes,
                 elapsed,
             } => {
+                // Rates are deltas against the previous sample for the same
+                // file and pass, so the slow probe phase does not drag the
+                // write rate down once muxing starts.
+                let (read_rate, write_rate) = match &self.current {
+                    Some(prev) if prev.index == index && prev.phase == phase => {
+                        let dt = elapsed.saturating_sub(prev.elapsed).as_secs_f64();
+                        if dt > 0.0 {
+                            (
+                                Some(bytes_done.saturating_sub(prev.bytes_done) as f64 / dt),
+                                Some(written_bytes.saturating_sub(prev.written_bytes) as f64 / dt),
+                            )
+                        } else {
+                            (prev.read_rate, prev.write_rate)
+                        }
+                    }
+                    _ => (None, None),
+                };
                 self.current = Some(ProgressSnapshot {
                     index,
                     phase,
                     bytes_done,
                     bytes_total,
+                    written_bytes,
                     elapsed,
+                    read_rate,
+                    write_rate,
                 });
             }
             WorkerEvent::JobDone { index, result } => {
@@ -1432,10 +1462,14 @@ impl App {
             ),
             RemuxPhase::Muxing => ("▶".to_string(), "writing", Color::Green),
         };
-        let speed = metrics
-            .megabytes_per_sec
-            .map(|v| format!("{v:.1} MB/s"))
-            .unwrap_or_else(|| "— MB/s".into());
+        // Read and write rates side by side, so a slow side is obvious.
+        let rate = |value: Option<f64>| {
+            value
+                .map(|mib| format!("{mib:.1}"))
+                .unwrap_or_else(|| "—".into())
+        };
+        let read = rate(metrics.read_megabytes_per_sec);
+        let write = rate(metrics.write_megabytes_per_sec);
         let eta = metrics
             .file_eta
             .map(|d| format!("ETA {}", fmt_eta(d)))
@@ -1444,7 +1478,11 @@ impl App {
             Span::styled(format!(" {marker} "), Style::default().fg(color)),
             Span::styled(name, Style::default().fg(Color::Cyan)),
             Span::styled(format!("  {action}"), Style::default().fg(color)),
-            Span::styled(format!("  {speed}"), Style::default().fg(Color::Green)),
+            Span::styled("  read ", Style::default().fg(Color::DarkGray)),
+            Span::styled(read, Style::default().fg(Color::Green)),
+            Span::styled(" · write ", Style::default().fg(Color::DarkGray)),
+            Span::styled(write, Style::default().fg(Color::Cyan)),
+            Span::styled(" MB/s", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("  {eta}"), Style::default().fg(Color::DarkGray)),
         ])
     }
@@ -1710,6 +1748,7 @@ fn spawn_rip(
                             phase: p.phase,
                             bytes_done: p.bytes_done,
                             bytes_total: p.bytes_total,
+                            written_bytes: p.written_bytes,
                             elapsed: started.elapsed(),
                         });
                     };
@@ -1886,10 +1925,12 @@ fn display_path(path: Option<&Path>) -> String {
 /// What the ripping screen derives from the latest progress snapshot.
 #[derive(Default)]
 struct Metrics {
-    /// Fraction of the current file's playback written (0 while probing).
+    /// Fraction of the current file's playback read (0 while probing).
     file_fraction: f64,
-    /// Output throughput for the current file.
-    megabytes_per_sec: Option<f64>,
+    /// Disc read throughput for the current file.
+    read_megabytes_per_sec: Option<f64>,
+    /// Output write throughput for the current file.
+    write_megabytes_per_sec: Option<f64>,
     /// Estimated time left for the current file.
     file_eta: Option<Duration>,
     /// Estimated time left for the whole queue.
@@ -1897,7 +1938,8 @@ struct Metrics {
 }
 
 /// Turn a progress snapshot into the numbers the UI shows. The current file's
-/// read rate and bytes-per-playback-second are used to extrapolate the queue.
+/// read rate and bytes-per-playback-second are used to extrapolate the queue;
+/// the instantaneous read and write rates show which side is the bottleneck.
 fn compute_metrics(
     current: Option<&ProgressSnapshot>,
     current_duration: Duration,
@@ -1913,7 +1955,9 @@ fn compute_metrics(
         (progress.bytes_done as f64 / progress.bytes_total as f64).clamp(0.0, 1.0)
     };
 
-    let (megabytes_per_sec, file_eta, overall_eta) = if elapsed > 0.0 && progress.bytes_done > 0 {
+    // The ETA uses the cumulative read rate, which stays stable across both
+    // passes; the displayed rates are the latest interval's.
+    let (file_eta, overall_eta) = if elapsed > 0.0 && progress.bytes_done > 0 {
         // Bytes read per wall second.
         let rate = progress.bytes_done as f64 / elapsed;
         let remaining = progress.bytes_total.saturating_sub(progress.bytes_done) as f64;
@@ -1928,18 +1972,15 @@ fn compute_metrics(
         let queue_eta = Duration::from_secs_f64(
             remaining_queue.as_secs_f64() * bytes_per_playback_second / rate,
         );
-        (
-            Some(rate / 1_048_576.0),
-            Some(file_eta),
-            Some(file_eta + queue_eta),
-        )
+        (Some(file_eta), Some(file_eta + queue_eta))
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     Metrics {
         file_fraction,
-        megabytes_per_sec,
+        read_megabytes_per_sec: progress.read_rate.map(|rate| rate / 1_048_576.0),
+        write_megabytes_per_sec: progress.write_rate.map(|rate| rate / 1_048_576.0),
         file_eta,
         overall_eta,
     }
@@ -2049,7 +2090,10 @@ mod tests {
             phase: RemuxPhase::Muxing,
             bytes_done: 60 * 1024 * 1024,
             bytes_total: 120 * 1024 * 1024,
+            written_bytes: 30 * 1024 * 1024,
             elapsed: Duration::from_secs(30),
+            read_rate: Some(2.0 * 1_048_576.0),
+            write_rate: Some(0.5 * 1_048_576.0),
         };
         let metrics = compute_metrics(
             Some(&snapshot),
@@ -2057,11 +2101,95 @@ mod tests {
             Duration::from_secs(120),
         );
         assert!((metrics.file_fraction - 0.5).abs() < 0.001);
-        assert!((metrics.megabytes_per_sec.unwrap() - 2.0).abs() < 0.001);
+        // The displayed rates come from the latest interval.
+        assert!((metrics.read_megabytes_per_sec.unwrap() - 2.0).abs() < 0.001);
+        assert!((metrics.write_megabytes_per_sec.unwrap() - 0.5).abs() < 0.001);
         // 2 MiB/s, 60 MiB left -> 30s for this file.
         assert_eq!(metrics.file_eta.unwrap(), Duration::from_secs(30));
         // 1 MiB of work per playback second, 120s queued at 2 MiB/s -> 60s.
         assert_eq!(metrics.overall_eta.unwrap(), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn metrics_report_read_and_write_rates_separately() {
+        // A fast disc with slow writes: the two rates must not be conflated.
+        let snapshot = ProgressSnapshot {
+            index: 0,
+            phase: RemuxPhase::Muxing,
+            bytes_done: 100 * 1024 * 1024,
+            bytes_total: 200 * 1024 * 1024,
+            written_bytes: 10 * 1024 * 1024,
+            elapsed: Duration::from_secs(10),
+            read_rate: Some(10.0 * 1_048_576.0),
+            write_rate: Some(1.0 * 1_048_576.0),
+        };
+        let metrics = compute_metrics(Some(&snapshot), Duration::from_secs(120), Duration::ZERO);
+        assert!((metrics.read_megabytes_per_sec.unwrap() - 10.0).abs() < 0.001);
+        assert!((metrics.write_megabytes_per_sec.unwrap() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn progress_rates_are_deltas_between_samples() {
+        let mut app = App::initial();
+        app.on_worker(WorkerEvent::JobProgress {
+            index: 0,
+            phase: RemuxPhase::Muxing,
+            bytes_done: 1024 * 1024,
+            bytes_total: 100 * 1024 * 1024,
+            written_bytes: 512 * 1024,
+            elapsed: Duration::from_secs(1),
+        });
+        assert!(
+            app.current.as_ref().unwrap().read_rate.is_none(),
+            "the first sample has no baseline"
+        );
+
+        app.on_worker(WorkerEvent::JobProgress {
+            index: 0,
+            phase: RemuxPhase::Muxing,
+            bytes_done: 3 * 1024 * 1024,
+            bytes_total: 100 * 1024 * 1024,
+            written_bytes: 1024 * 1024,
+            elapsed: Duration::from_secs(2),
+        });
+        let snapshot = app.current.as_ref().unwrap();
+        // 2 MiB read and 0.5 MiB written in one second.
+        assert!((snapshot.read_rate.unwrap() - 2.0 * 1_048_576.0).abs() < 1.0);
+        assert!((snapshot.write_rate.unwrap() - 0.5 * 1_048_576.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn ripping_screen_shows_read_and_write_rates() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::initial();
+        app.stage = Stage::Ripping;
+        app.total = 1;
+        app.jobs = vec![Job::new(&title(1, 1, 60), 1, 1, PathBuf::from("ep.mkv"))];
+        app.current = Some(ProgressSnapshot {
+            index: 0,
+            phase: RemuxPhase::Muxing,
+            bytes_done: 60 * 1024 * 1024,
+            bytes_total: 120 * 1024 * 1024,
+            written_bytes: 30 * 1024 * 1024,
+            elapsed: Duration::from_secs(30),
+            read_rate: Some(2.0 * 1_048_576.0),
+            write_rate: Some(0.5 * 1_048_576.0),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.ui(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Header (3) + gauge (3) puts the progress line on row 6.
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 6)].symbol())
+            .collect();
+
+        assert!(row.contains("read"), "row: {row:?}");
+        assert!(row.contains("2.0"), "row: {row:?}");
+        assert!(row.contains("write"), "row: {row:?}");
+        assert!(row.contains("0.5"), "row: {row:?}");
     }
 
     #[test]
@@ -2071,7 +2199,10 @@ mod tests {
             phase: RemuxPhase::Probing,
             bytes_done: 0,
             bytes_total: 120 * 1024 * 1024,
+            written_bytes: 0,
             elapsed: Duration::from_secs(5),
+            read_rate: None,
+            write_rate: None,
         };
         let metrics = compute_metrics(
             Some(&snapshot),
@@ -2079,7 +2210,8 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(metrics.file_fraction, 0.0);
-        assert!(metrics.megabytes_per_sec.is_none());
+        assert!(metrics.read_megabytes_per_sec.is_none());
+        assert!(metrics.write_megabytes_per_sec.is_none());
         assert!(metrics.file_eta.is_none());
         assert!(metrics.overall_eta.is_none());
     }

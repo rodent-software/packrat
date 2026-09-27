@@ -7,9 +7,10 @@
 //! copied bit-for-bit — there is no re-encode.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Seek, SeekFrom};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use oxideav_core::packet::PacketFlags;
 use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek};
@@ -58,7 +59,9 @@ pub enum RemuxPhase {
 ///
 /// A remux reads the title twice — once to discover its streams, once to mux
 /// them — so `bytes_done`/`bytes_total` span both passes and a throughput or
-/// time estimate is available from the very first sector.
+/// time estimate is available from the very first sector. `written_bytes`
+/// separates the disc read side from the output write side, so a caller can
+/// tell which one is the bottleneck.
 #[derive(Debug, Clone, Copy)]
 pub struct RemuxProgress {
     /// The pass currently running.
@@ -67,6 +70,8 @@ pub struct RemuxProgress {
     pub bytes_done: u64,
     /// VOB bytes that will be read across both passes.
     pub bytes_total: u64,
+    /// Bytes handed to the output writer so far.
+    pub written_bytes: u64,
 }
 
 /// Remux a whole title to `out`.
@@ -187,6 +192,38 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
 }
 
+/// Wraps the output writer and keeps a running total of the bytes handed to
+/// it, so progress can report a write rate alongside the disc read rate. The
+/// count lives behind an `Arc<AtomicU64>` because the writer must stay `Send`.
+struct CountingWriter<W> {
+    inner: W,
+    written: Arc<AtomicU64>,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, written: Arc<AtomicU64>) -> Self {
+        Self { inner, written }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for CountingWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
 /// Like [`remux_chapters`], but over any `Read + Seek` positioned within the
 /// title's VOB chain — which is how the raw-device (libdvdcss) path feeds in
 /// decrypted, re-addressed sectors.
@@ -254,6 +291,8 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
         .saturating_mul(2)
         .saturating_mul(SECTOR as u64);
     let mut read_bytes = 0u64;
+    // Output bytes are counted by the writer; nothing is written until pass 2.
+    let written_bytes = Arc::new(AtomicU64::new(0));
 
     // Pass 1: discover the elementary streams, because Matroska's `Tracks`
     // element must be written before the first packet. The video sequence
@@ -269,6 +308,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
                 phase: RemuxPhase::Probing,
                 bytes_done: read_bytes,
                 bytes_total,
+                written_bytes: 0,
             });
         };
         for_each_pes(
@@ -341,7 +381,10 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
         path: temp.clone(),
         source,
     })?;
-    let writer: Box<dyn WriteSeek> = Box::new(BufWriter::new(out_file));
+    let writer: Box<dyn WriteSeek> = Box::new(CountingWriter::new(
+        BufWriter::new(out_file),
+        Arc::clone(&written_bytes),
+    ));
     let mut muxer = MkvMuxer::new_matroska(writer, &stream_infos)
         .map_err(|e| DiscError::Remux(format!("mux init: {e}")))?;
     muxer
@@ -391,6 +434,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
             phase: RemuxPhase::Muxing,
             bytes_done: read_bytes,
             bytes_total,
+            written_bytes: written_bytes.load(Ordering::Relaxed),
         });
     };
 
@@ -1386,6 +1430,17 @@ mod tests {
         );
         assert_eq!(display_aspect_ratio(AspectRatioCode::Square), None);
         assert_eq!(display_aspect_ratio(AspectRatioCode::Forbidden), None);
+    }
+
+    #[test]
+    fn counting_writer_tracks_output_bytes() {
+        let written = Arc::new(AtomicU64::new(0));
+        let mut writer = CountingWriter::new(Vec::new(), Arc::clone(&written));
+
+        writer.write_all(b"hello").unwrap();
+        writer.write_all(&[0u8; 10]).unwrap();
+
+        assert_eq!(written.load(Ordering::Relaxed), 15);
     }
 
     #[test]

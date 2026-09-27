@@ -490,6 +490,39 @@ impl App {
         self.refresh_drives();
     }
 
+    /// Whether the drive the loaded disc came from still reports ready media.
+    /// A manually loaded path is not tied to a drive, so it is assumed present.
+    fn loaded_drive_ready(&self, drives: &[OpticalDrive]) -> bool {
+        match &self.device {
+            Some(device) => drives
+                .iter()
+                .any(|drive| &drive.device == device && drive.has_disc && drive.mount.is_some()),
+            None => true,
+        }
+    }
+
+    /// Forget the loaded disc and return to the picker, e.g. after an eject, so
+    /// the plan does not linger over a disc that is no longer there.
+    fn clear_disc(&mut self) {
+        self.source = None;
+        self.disc = None;
+        self.classification = None;
+        self.label = None;
+        self.device = None;
+        self.loaded = None;
+        self.naming = None;
+        self.meta_show = None;
+        self.meta_note = None;
+        self.meta_state = MetaState::Idle;
+        self.jobs.clear();
+        self.job_cursor = 0;
+        self.show_input = TextInput::default();
+        self.season_input = TextInput::default();
+        self.detect_note = Some("Disc ejected — insert a disc or choose a drive".into());
+        self.detect_focus = DetectField::Drives;
+        self.stage = Stage::Detect;
+    }
+
     /// Replace the drive list, keeping the cursor on the drive that was
     /// highlighted, then the last-used one, then the first ready disc.
     fn set_drives(&mut self, drives: Vec<OpticalDrive>) {
@@ -1022,12 +1055,18 @@ impl App {
                 self.detect_loading = false;
                 self.scan_in_flight = false;
                 let none_found = drives.is_empty();
+                // The disc was ejected while its plan was up: drop the plan and
+                // fall back to the picker rather than showing stale metadata.
+                let loaded_gone = self.disc.is_some() && !self.loaded_drive_ready(&drives);
                 self.set_drives(drives);
+                self.detect_note = None;
                 // With nothing to pick, put the caret in the manual path box.
                 if none_found && self.detect_focus == DetectField::Drives {
                     self.detect_focus = DetectField::Path;
                 }
-                self.detect_note = None;
+                if loaded_gone {
+                    self.clear_disc();
+                }
             }
             WorkerEvent::DiscError(e) => {
                 self.detect_loading = false;
@@ -2828,6 +2867,56 @@ mod tests {
 
         assert_eq!(app.stage, Stage::Detect);
         assert_eq!(app.detect_focus, DetectField::Drives);
+    }
+
+    #[test]
+    fn ejecting_the_disc_clears_the_plan() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.device = Some(PathBuf::from("/dev/sr0"));
+        app.loaded = Some("fingerprint".into());
+        app.jobs = vec![Job::new(&title(1, 1, 60), 1, 1, PathBuf::from("ep.mkv"))];
+
+        // The drive is still attached but no longer holds a disc.
+        app.on_worker(WorkerEvent::Drives(vec![drive("/dev/sr0", false, None)]));
+
+        assert_eq!(app.stage, Stage::Detect);
+        assert!(app.disc.is_none());
+        assert!(app.jobs.is_empty());
+        assert!(app.detect_note.is_some(), "the user is told why it cleared");
+    }
+
+    #[test]
+    fn a_still_loaded_disc_keeps_the_plan() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.device = Some(PathBuf::from("/dev/sr0"));
+
+        app.on_worker(WorkerEvent::Drives(vec![drive(
+            "/dev/sr0",
+            true,
+            Some("/mnt/a"),
+        )]));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert!(app.disc.is_some());
+    }
+
+    #[test]
+    fn a_manual_path_disc_survives_a_drive_rescan() {
+        let mut app = App::initial();
+        app.stage = Stage::Plan;
+        app.disc = Some(disc(vec![title(1, 1, 60)]));
+        app.device = None;
+
+        // No drive is associated with a path-typed disc, so a scan that finds
+        // none must not clear it.
+        app.on_worker(WorkerEvent::Drives(vec![drive("/dev/sr0", false, None)]));
+
+        assert_eq!(app.stage, Stage::Plan);
+        assert!(app.disc.is_some());
     }
 
     #[test]

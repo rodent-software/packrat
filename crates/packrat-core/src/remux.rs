@@ -19,8 +19,8 @@ use oxideav_dvd::vob::{
     SC_PADDING_STREAM, SC_PRIVATE_STREAM_1, SC_PRIVATE_STREAM_2, SC_SYSTEM_HEADER,
 };
 use oxideav_dvd::{
-    Ac3Header, AspectRatioCode, AudioSubstreamHeader, DtsHeader, DvdChapter, DvdTitle,
-    PictureCodingExtension, PictureHeader, PictureStructure, SequenceHeader, VtsIfo,
+    Ac3Header, AspectRatioCode, AudioAttributes, AudioSubstreamHeader, DtsHeader, DvdChapter,
+    DvdTitle, PictureCodingExtension, PictureHeader, PictureStructure, SequenceHeader, VtsIfo,
 };
 use oxideav_mkv::mux::{MkvMuxer, MkvVideoGeometry};
 
@@ -347,15 +347,22 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
     tracks.sort();
 
     let video_index = tracks.iter().position(|t| matches!(t, Track::Video));
+    let audio_streams = &vts.mat.title_attributes.audio_streams;
     let mut stream_infos: Vec<StreamInfo> = tracks
         .iter()
         .enumerate()
-        .map(|(i, track)| StreamInfo {
-            index: i as u32,
-            time_base: PES_TIME_BASE,
-            duration: None,
-            start_time: None,
-            params: codec_parameters(*track),
+        .map(|(i, track)| {
+            let mut params = codec_parameters(*track);
+            if let Some(channels) = audio_channels(audio_streams, track) {
+                params.channels = Some(channels);
+            }
+            StreamInfo {
+                index: i as u32,
+                time_base: PES_TIME_BASE,
+                duration: None,
+                start_time: None,
+                params,
+            }
         })
         .collect();
     if let (Some(index), Some((width, height))) = (video_index, video_size) {
@@ -1155,11 +1162,30 @@ fn codec_parameters(track: Track) -> CodecParameters {
         Track::Ac3(_) | Track::Dts(_) | Track::Lpcm(_) => {
             let mut params = CodecParameters::audio(track.codec_id());
             params.sample_rate = Some(48_000);
+            // Fallback only; the real count is filled in from the title set's
+            // IFO stream attributes, which matters for 5.1 discs where a stereo
+            // label can make a player skip a proper downmix.
             params.channels = Some(2);
             params
         }
         Track::Subpicture(_) => CodecParameters::subtitle(track.codec_id()),
     }
+}
+
+/// Channel count for an audio track from the title set's IFO stream
+/// attributes. DVD audio streams are numbered in the same order as their VOB
+/// substreams, so the local track index selects the attribute slot. `None`
+/// means the IFO did not carry the attributes and the caller should keep its
+/// default.
+fn audio_channels(audio_streams: &[AudioAttributes], track: &Track) -> Option<u16> {
+    let index = match track {
+        Track::Ac3(index) | Track::Dts(index) | Track::Lpcm(index) => usize::from(*index),
+        Track::Video | Track::Subpicture(_) => return None,
+    };
+    audio_streams
+        .get(index)
+        .map(|attributes| u16::from(attributes.channel_count))
+        .filter(|channels| *channels > 0)
 }
 
 /// Call `f` for every PES packet across the selected chapters. `on_sectors` is
@@ -1441,6 +1467,23 @@ mod tests {
         writer.write_all(&[0u8; 10]).unwrap();
 
         assert_eq!(written.load(Ordering::Relaxed), 15);
+    }
+
+    #[test]
+    fn audio_channel_count_comes_from_the_ifo() {
+        // Byte 1 bits 2..0 hold `channels - 1`, so 5 means 5.1 (6 channels).
+        let mut six = [0u8; 8];
+        six[1] = 5;
+        let streams = [
+            AudioAttributes::parse(&six),
+            AudioAttributes::parse(&[0u8; 8]),
+        ];
+
+        assert_eq!(audio_channels(&streams, &Track::Ac3(0)), Some(6));
+        assert_eq!(audio_channels(&streams, &Track::Dts(1)), Some(1));
+        // No attribute slot for this stream: the caller keeps its default.
+        assert_eq!(audio_channels(&streams, &Track::Ac3(7)), None);
+        assert_eq!(audio_channels(&streams, &Track::Video), None);
     }
 
     #[test]

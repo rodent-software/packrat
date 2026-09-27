@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "packrat"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "libloading",
  "oxideav-core",

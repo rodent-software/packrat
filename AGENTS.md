@@ -1,9 +1,5 @@
 # Agents
 
-Do not edit README.md it is purposefully written by a human.
-
-When running in a sandbox you must redirect CARGO_HOME to the working directory.
-
-```sh
-export CARGO_HOME="$PWD/.cargo-home"
-```
+- Do not editorialize the project description.
+- Do not edit README.md it is purposefully written by a human.
+- Redirect CARGO_HOME when using a sandbox `export CARGO_HOME="$PWD/.cargo-home"`

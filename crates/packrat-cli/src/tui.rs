@@ -950,11 +950,11 @@ impl App {
                 _ => {}
             },
             Stage::Done => match key.code {
-                KeyCode::Char('c') => self.back_to_plan(),
+                // Enter starts another disc, matching the picker; q quits,
+                // like every other screen. `c` stays as an alias.
+                KeyCode::Enter | KeyCode::Char('c') => self.back_to_plan(),
                 KeyCode::Char('x') => self.eject_and_configure(),
-                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char(' ') => {
-                    self.should_quit = true;
-                }
+                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 _ => {}
             },
         }
@@ -1910,9 +1910,9 @@ impl App {
             ],
             Stage::Ripping => vec![("q", "stop after this file"), ("a", "abort now")],
             Stage::Done => vec![
-                ("c", "configure another"),
+                ("Enter", "configure another"),
                 ("x", "eject & configure"),
-                ("Enter", "quit"),
+                ("q", "quit"),
             ],
         };
         let mut spans = vec![Span::raw(" ")];
@@ -2531,7 +2531,7 @@ impl App {
             )));
         }
         lines.push(Line::from(Span::styled(
-            "Press c to configure another, x to eject, or Enter to quit.",
+            "Press enter to configure another, x to eject, or q to quit.",
             Style::default().fg(Color::DarkGray),
         )));
         f.render_widget(
@@ -2634,7 +2634,7 @@ impl App {
             Line::from("s                 open settings"),
             Line::from("x                 eject the disc · eject & configure (done)"),
             Line::from("d                 change drive"),
-            Line::from("Enter             load a drive · apply the plan · save settings"),
+            Line::from("Enter             load a drive · apply the plan · save settings · another disc (done)"),
             Line::from("r                 rescan drives · start backing up"),
             Line::from("q / Esc           quit (while ripping: stop after this file)"),
             Line::from("Ctrl+C            stop now and quit"),
@@ -3475,6 +3475,28 @@ mod tests {
             .iter()
             .all(|job| matches!(job.status, JobStatus::Pending)));
         assert!(!app.jobs[1].enabled, "selections are preserved");
+    }
+
+    #[test]
+    fn done_screen_enter_configures_another() {
+        let mut app = App::initial();
+        app.stage = Stage::Done;
+        app.jobs = vec![Job::new(&title(1, 1, 60), 1, 1, PathBuf::from("a.mkv"))];
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.stage, Stage::Plan));
+        assert!(!app.should_quit, "Enter must not quit");
+    }
+
+    #[test]
+    fn done_screen_q_quits() {
+        let mut app = App::initial();
+        app.stage = Stage::Done;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert!(app.should_quit);
     }
 
     #[test]

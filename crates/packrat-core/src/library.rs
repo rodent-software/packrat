@@ -160,6 +160,39 @@ pub fn highest_episode(dir: &Path, season: u16) -> Option<u16> {
     highest
 }
 
+/// Episodes already present in the show's seasons *before* `season`, summed
+/// over their season folders.
+///
+/// This is the show's global episode position at the start of `season` as the
+/// discs number it. A provider may split the show at different points, so a
+/// disc's episode number cannot be looked up in the provider's season of the
+/// same name; the episodes before it can still be counted, though, and the
+/// display number is what a disc set already gave us.
+pub fn episodes_before_season(show_dir: &Path, season: u16) -> usize {
+    let Ok(entries) = std::fs::read_dir(show_dir) else {
+        return 0;
+    };
+    let mut total = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(number) = season_number_from_dir(name) else {
+            continue;
+        };
+        if number < season {
+            total += usize::from(highest_episode(&entry.path(), number).unwrap_or(0));
+        }
+    }
+    total
+}
+
+/// The number in a `Season NN` folder name.
+fn season_number_from_dir(name: &str) -> Option<u16> {
+    name.strip_prefix("Season ")?.trim().parse().ok()
+}
+
 /// Extra (featurette/trailer/etc.) belonging to a show:
 /// `<tv_dir>/<Show (Year)>/Other/<Description>.mkv`.
 ///
@@ -442,6 +475,28 @@ mod tests {
 
         assert_eq!(highest_episode(&dir, 1), Some(7));
         assert_eq!(highest_episode(&dir, 2), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn episodes_before_a_season_sum_the_earlier_folders() {
+        let dir = std::env::temp_dir().join(format!("packrat-before-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (season, highest) in [(1u16, 28u16), (2, 5), (3, 1)] {
+            let season_dir = dir.join(format!("Season {season:02}"));
+            std::fs::create_dir_all(&season_dir).unwrap();
+            std::fs::write(
+                season_dir.join(format!("Show - s{season:02}e{highest:02}.mkv")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(episodes_before_season(&dir, 1), 0);
+        assert_eq!(episodes_before_season(&dir, 2), 28);
+        assert_eq!(episodes_before_season(&dir, 3), 33);
+        assert_eq!(episodes_before_season(&dir, 4), 34);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

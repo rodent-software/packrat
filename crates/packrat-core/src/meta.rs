@@ -242,6 +242,51 @@ pub fn match_episodes_from(
         .collect()
 }
 
+/// Content episodes (specials excluded) in provider order.
+fn content_in_order(episodes: &[Episode]) -> Vec<&Episode> {
+    let mut ordered: Vec<&Episode> = episodes.iter().filter(|e| e.season > 0).collect();
+    ordered.sort_by_key(|e| (e.season, e.number.unwrap_or(0)));
+    ordered
+}
+
+/// Map `segments` onto the provider's episodes starting at global position
+/// `start`, naming them `first`, `first + 1`, … (the disc's own numbering).
+///
+/// This is [`match_episodes_from`] for a destination whose season boundaries
+/// differ from the provider's: the titles always come from the provider's
+/// global order, so a "season 2" episode 1 on a disc is episode 32 of the show
+/// even though the provider calls that 2x04.
+pub fn match_episodes_global(
+    episodes: &[Episode],
+    season: u16,
+    first: u16,
+    start: usize,
+    segments: &[Duration],
+) -> Vec<EpisodeMatch> {
+    let runtime_of = |episode: &Episode| {
+        episode
+            .runtime
+            .map(|m| Duration::from_secs(u64::from(m) * 60))
+    };
+    let ordered = content_in_order(episodes);
+
+    segments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _segment)| {
+            let number = first.checked_add(u16::try_from(i).ok()?)?;
+            let episode = ordered.get(start + i).copied();
+            Some(EpisodeMatch {
+                season,
+                number,
+                title: episode.and_then(|e| e.name.clone()),
+                runtime: episode.and_then(runtime_of),
+                segment: i,
+            })
+        })
+        .collect()
+}
+
 /// A single file that spans several consecutive episodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeSpan {
@@ -372,6 +417,49 @@ pub fn match_span_from(
     })
 }
 
+/// Best span of consecutive provider content episodes starting at global
+/// position `start`, anchored at the disc's episode number `first`.
+///
+/// The global counterpart to [`match_span_from`]: the run may cross the
+/// provider's season boundary without losing its titles.
+pub fn match_span_global(
+    episodes: &[Episode],
+    season: u16,
+    first: u16,
+    start: usize,
+    segment: Duration,
+) -> Option<EpisodeSpan> {
+    let ordered = content_in_order(episodes);
+    let target = segment.as_secs_f64().max(1.0);
+    let mut candidates: Vec<(f64, usize)> = Vec::new();
+    let mut sum = 0.0f64;
+    for (offset, episode) in ordered.iter().enumerate().skip(start) {
+        let Some(minutes) = episode.runtime else {
+            continue;
+        };
+        sum += f64::from(minutes) * 60.0;
+        if sum > target * 1.5 {
+            break;
+        }
+        let count = offset + 1 - start;
+        candidates.push((((sum - target) / target).abs(), count));
+    }
+
+    let (error, count) = candidates.into_iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+    if error > 0.15 {
+        return None;
+    }
+
+    let title = (count == 1).then(|| ordered[start].name.clone()).flatten();
+    let last = first.checked_add(u16::try_from(count - 1).ok()?)?;
+    Some(EpisodeSpan {
+        season,
+        first,
+        last,
+        title,
+    })
+}
+
 /// Minimal percent-encoding for a query string.
 fn encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -399,6 +487,77 @@ mod tests {
             number: Some(number),
             runtime: Some(runtime),
         }
+    }
+
+    fn named_episode(season: u32, number: u32, name: &str, runtime: u32) -> Episode {
+        Episode {
+            id: number,
+            name: Some(name.to_string()),
+            season,
+            number: Some(number),
+            runtime: Some(runtime),
+        }
+    }
+
+    /// A destination whose "season 2" starts inside the provider's season 2
+    /// (a DVD set that splits the show earlier) still gets the right titles,
+    /// because they come from the provider's global order, not its season.
+    #[test]
+    fn global_start_ignores_the_provider_season_boundary() {
+        let episodes = vec![
+            named_episode(1, 1, "S1E1", 24),
+            named_episode(1, 2, "S1E2", 24),
+            named_episode(1, 3, "S1E3", 24),
+            named_episode(2, 1, "S2E1", 24),
+            named_episode(2, 2, "S2E2", 24),
+            named_episode(2, 3, "S2E3", 24),
+            named_episode(2, 4, "S2E4", 24),
+        ];
+        let segments: Vec<Duration> = (0..2).map(|_| Duration::from_secs(24 * 60)).collect();
+
+        // The disc calls this "season 2 episode 1", but three episodes of the
+        // show already precede it, so it is really the provider's S2E3.
+        let matched = match_episodes_global(&episodes, 2, 1, 5, &segments);
+
+        let labels: Vec<(u16, Option<&str>)> = matched
+            .iter()
+            .map(|m| (m.number, m.title.as_deref()))
+            .collect();
+        assert_eq!(labels, vec![(1, Some("S2E3")), (2, Some("S2E4"))]);
+    }
+
+    /// Past the provider's last episode there is nothing left to name.
+    #[test]
+    fn global_start_runs_past_the_provider_last_episode() {
+        let episodes = vec![
+            named_episode(1, 1, "S1E1", 24),
+            named_episode(1, 2, "S1E2", 24),
+        ];
+        let segments: Vec<Duration> = (0..3).map(|_| Duration::from_secs(24 * 60)).collect();
+
+        let matched = match_episodes_global(&episodes, 1, 1, 1, &segments);
+
+        assert_eq!(matched[0].title.as_deref(), Some("S1E2"));
+        assert!(matched[1].title.is_none());
+        assert!(matched[2].title.is_none());
+    }
+
+    /// A whole-file title whose span crosses the provider's season boundary
+    /// keeps the right episode count and loses only the redundant title.
+    #[test]
+    fn global_span_crosses_a_provider_season_boundary() {
+        let episodes = vec![
+            named_episode(1, 1, "S1E1", 24),
+            named_episode(1, 2, "S1E2", 24),
+            named_episode(2, 1, "S2E1", 24),
+            named_episode(2, 2, "S2E2", 24),
+        ];
+
+        let span =
+            match_span_global(&episodes, 1, 1, 1, Duration::from_secs(48 * 60)).expect("span");
+
+        assert_eq!((span.first, span.last), (1, 2));
+        assert_eq!(span.title, None, "a multi-episode span has no single title");
     }
 
     #[test]

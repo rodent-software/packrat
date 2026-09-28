@@ -13,12 +13,12 @@ use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use packrat_core::{
-    alternates, classify, display_name, episode_file_in, episode_range_file_in, extra_file_in,
-    feature_titles, match_episodes, match_episodes_from, match_span, match_span_from,
-    movie_extra_file_in, movie_extras, movie_file_in, parse_label, preferred_titles, read_disc,
-    read_vts, remux_chain, resolve_movie, search_show, split_title, DiscKind, DiscModel,
-    DiscSource, Episode, EpisodeMatch, EpisodeSpan, Movie, MovieQuery, OpticalDrive, Show, Title,
-    EXTRA_MIN, MIN_CONTENT,
+    alternates, classify, display_name, episode_file_in, episode_range_file_in,
+    episodes_before_season, extra_file_in, feature_titles, match_episodes_global,
+    match_span_global, movie_extra_file_in, movie_extras, movie_file_in, parse_label,
+    preferred_titles, read_disc, read_vts, remux_chain, resolve_movie, search_show, split_title,
+    DiscKind, DiscModel, DiscSource, Episode, EpisodeMatch, EpisodeSpan, Movie, MovieQuery,
+    OpticalDrive, Show, Title, EXTRA_MIN, MIN_CONTENT,
 };
 
 #[derive(Parser)]
@@ -813,39 +813,111 @@ pub(crate) fn resolve_naming(
     };
     let season = season_override.or(label.season).unwrap_or(1);
     let episodes = packrat_core::meta::episodes(show.id).context("fetching episodes")?;
-    let hints = disc_episode_hints(&episodes, season, disc, preferred, label.disc);
     let year = show.year();
     let name = show_override
         .map(str::to_string)
         .unwrap_or_else(|| show.name.clone());
 
+    let (episodes_by_title, spans) = match_disc_episodes(
+        tv_dir,
+        &name,
+        year,
+        season,
+        disc,
+        label.disc,
+        &episodes,
+        preferred,
+        first_episode,
+    );
+
+    Ok(Resolved {
+        show: Some(show),
+        naming: Some(Naming {
+            tv_dir: tv_dir.to_path_buf(),
+            show: name,
+            year,
+            episodes: episodes_by_title,
+            spans,
+        }),
+        warning: None,
+    })
+}
+
+/// Match a disc's preferred titles to provider episodes, using the destination
+/// library to place the disc in the show's global episode order.
+///
+/// A DVD set does not split a show where the provider does, so a disc's own
+/// episode number cannot simply be looked up in the provider's season of the
+/// same name. The library's earlier seasons say how many episodes precede this
+/// season on the discs, and that many provider episodes is where it starts;
+/// the disc's own number is what goes in the file name.
+#[allow(clippy::too_many_arguments)]
+fn match_disc_episodes(
+    tv_dir: &Path,
+    name: &str,
+    year: Option<u16>,
+    season: u16,
+    disc: &DiscModel,
+    disc_number: Option<u16>,
+    episodes: &[Episode],
+    preferred: &[u16],
+    manual_first: Option<u16>,
+) -> (HashMap<u16, Vec<EpisodeMatch>>, HashMap<u16, EpisodeSpan>) {
+    let hints = disc_episode_hints(episodes, season, disc, preferred, disc_number);
+
+    // Where this season starts in the show's global episode order. The
+    // provider's own season boundary cannot say, but the earlier seasons
+    // already backed up can; fall back to the provider's earlier-season count
+    // for a library that has none.
+    let show_dir = packrat_core::library::show_dir_in(tv_dir, name, year);
+    let library_before = episodes_before_season(&show_dir, season);
+    let provider_before = provider_episodes_before(episodes, season);
+    let position_before = if library_before > 0 {
+        library_before
+    } else {
+        provider_before
+    };
+
     // Number from the user's correction when they made one, else continue
     // after the episodes already in the destination season: the label's disc
     // number cannot tell us that a final disc holds fewer episodes than the
     // earlier ones, but the files already backed up can.
-    let first_episode = first_episode_for(tv_dir, &name, year, season, first_episode);
+    let mut next_episode =
+        manual_first.or_else(|| first_episode_for(tv_dir, name, year, season, None));
 
     let mut by_title = HashMap::new();
     let mut spans = HashMap::new();
-    // A first episode numbers the disc's preferred titles in order, each
-    // continuing where the previous one stopped. Without one the provider
-    // runtime and the disc hint choose the window as before.
-    let mut next_episode = first_episode;
     for number in preferred {
         let Some(title) = disc.titles.iter().find(|t| t.number == *number) else {
             continue;
         };
-        let hint = hints.get(number).copied();
         let segments = split_title(title);
+        // The disc's own number for this title's first episode, and where that
+        // episode sits in the provider's global order. Without a library start
+        // the disc-number hint places it; the library still supplies the
+        // season's global offset.
+        let (first, global) = match next_episode {
+            Some(first) => (
+                first,
+                position_before.saturating_add(usize::from(first.saturating_sub(1))),
+            ),
+            None => {
+                let offset = hints.get(number).copied().unwrap_or(0);
+                (
+                    u16::try_from(offset + 1).unwrap_or(u16::MAX),
+                    position_before.saturating_add(offset),
+                )
+            }
+        };
         if segments.len() < 2 {
             // Delivered as one file: see whether it spans several episodes.
-            let span = match next_episode {
-                Some(first) => {
-                    match_span_from(&episodes, season, first, title.duration.unwrap_or_default())
-                }
-                None => match_span(&episodes, season, title.duration.unwrap_or_default(), hint),
-            };
-            if let Some(span) = span {
+            if let Some(span) = match_span_global(
+                episodes,
+                season,
+                first,
+                global,
+                title.duration.unwrap_or_default(),
+            ) {
                 if next_episode.is_some() {
                     next_episode = span.last.checked_add(1);
                 }
@@ -854,10 +926,7 @@ pub(crate) fn resolve_naming(
             continue;
         }
         let durations: Vec<Duration> = segments.iter().map(|s| s.duration).collect();
-        let matched = match next_episode {
-            Some(first) => match_episodes_from(&episodes, season, first, &durations),
-            None => match_episodes(&episodes, season, &durations, hint),
-        };
+        let matched = match_episodes_global(episodes, season, first, global, &durations);
         if next_episode.is_some() {
             if let Some(last) = matched.last() {
                 next_episode = last.number.checked_add(1);
@@ -866,17 +935,7 @@ pub(crate) fn resolve_naming(
         by_title.insert(*number, matched);
     }
 
-    Ok(Resolved {
-        show: Some(show),
-        naming: Some(Naming {
-            tv_dir: tv_dir.to_path_buf(),
-            show: name,
-            year,
-            episodes: by_title,
-            spans,
-        }),
-        warning: None,
-    })
+    (by_title, spans)
 }
 
 /// Guess where each preferred title starts within its season, so a disc other
@@ -918,6 +977,14 @@ fn disc_episode_hints(
         .into_iter()
         .map(|(number, offset)| (number, start + offset))
         .collect()
+}
+
+/// Content episodes in provider seasons before `season`.
+fn provider_episodes_before(episodes: &[Episode], season: u16) -> usize {
+    episodes
+        .iter()
+        .filter(|e| e.season > 0 && e.season < u32::from(season))
+        .count()
 }
 
 /// Mean runtime of a season's episodes, when the provider supplies any.
@@ -1199,29 +1266,24 @@ fn identify_tv(disc: &DiscModel, dest: &Destinations, first_episode: Option<u16>
 
     let episodes = packrat_core::meta::episodes(show.id).context("fetching episodes")?;
     let preferred = preferred_titles(disc);
-    let hints = disc_episode_hints(&episodes, season, disc, &preferred, label.disc);
+    let (by_title, _spans) = match_disc_episodes(
+        &tv_dir,
+        &show.name,
+        year,
+        season,
+        disc,
+        label.disc,
+        &episodes,
+        &preferred,
+        first_episode,
+    );
 
-    let mut next_episode = first_episode_for(&tv_dir, &show.name, year, season, first_episode);
     for number in preferred {
-        let Some(title) = disc.titles.iter().find(|t| t.number == number) else {
+        let Some(matched) = by_title.get(&number) else {
             continue;
         };
-        let segments = split_title(title);
-        if segments.len() < 2 {
-            continue;
-        }
-        let durations: Vec<Duration> = segments.iter().map(|s| s.duration).collect();
-        let matched = match next_episode {
-            Some(first) => match_episodes_from(&episodes, season, first, &durations),
-            None => match_episodes(&episodes, season, &durations, hints.get(&number).copied()),
-        };
-        if next_episode.is_some() {
-            if let Some(last) = matched.last() {
-                next_episode = last.number.checked_add(1);
-            }
-        }
         println!("\nTitle {} -> {} episode(s):", number, matched.len());
-        for m in &matched {
+        for m in matched {
             let out = episode_file_in(
                 &tv_dir,
                 &show.name,
@@ -1542,7 +1604,7 @@ mod tests {
             .iter()
             .filter_map(|n| {
                 let title = disc.titles.iter().find(|t| t.number == *n)?;
-                let span = match_span(
+                let span = packrat_core::match_span(
                     &episodes,
                     1,
                     title.duration.unwrap_or_default(),

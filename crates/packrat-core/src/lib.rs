@@ -30,12 +30,13 @@ pub use error::DiscError;
 pub use identify::{parse_label, LabelInfo};
 pub use library::{
     display_name, episode_file, episode_file_in, episode_range_file, episode_range_file_in,
-    extra_file, extra_file_in, movie_dir_in, movie_extra_file_in, movie_file, movie_file_in,
-    movie_part_file_in, sanitize_component, season_dir, season_dir_in, show_dir, show_dir_in,
+    episodes_before_season, extra_file, extra_file_in, movie_dir_in, movie_extra_file_in,
+    movie_file, movie_file_in, movie_part_file_in, sanitize_component, season_dir, season_dir_in,
+    show_dir, show_dir_in,
 };
 pub use meta::{
-    match_episodes, match_episodes_from, match_span, match_span_from, search_show, Episode,
-    EpisodeMatch, EpisodeSpan, MetaError, Show,
+    match_episodes, match_episodes_from, match_episodes_global, match_span, match_span_from,
+    match_span_global, search_show, Episode, EpisodeMatch, EpisodeSpan, MetaError, Show,
 };
 pub use movie::{
     rank as rank_movies, resolve as resolve_movie, MovieQuery, MovieResolution, AUTO_ACCEPT,

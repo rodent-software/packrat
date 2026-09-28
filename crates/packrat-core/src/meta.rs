@@ -194,9 +194,11 @@ pub fn match_episodes(
 ///
 /// This backs a user's manual correction of a disc whose place in the season
 /// the label got wrong (a final disc with fewer episodes than the earlier
-/// ones, say). Numbers increase by one per segment and do not need to exist in
-/// the provider's list: an episode the provider does not know is still named
-/// with the number the user asked for, just without a title or runtime.
+/// ones, say). Numbers increase by one per segment. A run that leaves the
+/// provider's season — a DVD set does not split a show the way TVmaze does —
+/// keeps its own numbers but takes titles from the next provider season, so
+/// the episodes are not left unlabelled; only a number past the provider's
+/// last episode has no title.
 pub fn match_episodes_from(
     episodes: &[Episode],
     season: u16,
@@ -209,6 +211,12 @@ pub fn match_episodes_from(
             .map(|m| Duration::from_secs(u64::from(m) * 60))
     };
 
+    // Provider order, so a number the season does not reach continues into the
+    // seasons after it.
+    let mut ordered: Vec<&Episode> = episodes.iter().collect();
+    ordered.sort_by_key(|e| (e.season, e.number.unwrap_or(0)));
+    let season_start = ordered.iter().position(|e| e.season == u32::from(season));
+
     segments
         .iter()
         .enumerate()
@@ -216,7 +224,13 @@ pub fn match_episodes_from(
             let number = first.checked_add(u16::try_from(i).ok()?)?;
             let episode = episodes
                 .iter()
-                .find(|e| e.season == u32::from(season) && e.number == Some(u32::from(number)));
+                .find(|e| e.season == u32::from(season) && e.number == Some(u32::from(number)))
+                .or_else(|| {
+                    let start = season_start?;
+                    ordered
+                        .get(start + usize::from(number.saturating_sub(1)))
+                        .copied()
+                });
             Some(EpisodeMatch {
                 season,
                 number,
@@ -571,6 +585,38 @@ mod tests {
         assert_eq!(numbers, vec![29, 30, 31]);
         // The provider has no episodes at those numbers, so there are no titles.
         assert!(matched.iter().all(|m| m.title.is_none()));
+    }
+
+    /// A run that leaves the provider's season continues into the next one:
+    /// a DVD set whose episode count differs from the provider's still gets
+    /// titles for the overflow instead of leaving them blank.
+    #[test]
+    fn explicit_start_continues_into_the_next_season() {
+        let mut episodes: Vec<Episode> = (1..=3).map(|n| episode(n, 24)).collect();
+        episodes.extend((1..=2).map(|n| Episode {
+            season: 2,
+            ..episode(n, 24)
+        }));
+        let segments: Vec<Duration> = (0..5).map(|_| Duration::from_secs(24 * 60)).collect();
+
+        let matched = match_episodes_from(&episodes, 1, 2, &segments);
+
+        let labels: Vec<(u16, Option<&str>)> = matched
+            .iter()
+            .map(|m| (m.number, m.title.as_deref()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (2, Some("Episode 2")),
+                (3, Some("Episode 3")),
+                // Season 1 stopped at 3, so these take season 2's episodes.
+                (4, Some("Episode 1")),
+                (5, Some("Episode 2")),
+                // Past the provider's last episode there is nothing to name.
+                (6, None),
+            ]
+        );
     }
 
     #[test]

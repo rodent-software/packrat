@@ -865,7 +865,13 @@ impl App {
 
             let events: Vec<WorkerEvent> = self.rx.try_iter().collect();
             for ev in events {
+                // Inspect before `on_worker` consumes the event; ring after, so
+                // the bell lands once the run has fully settled.
+                let bell = rings_bell(&ev);
                 self.on_worker(ev);
+                if bell {
+                    ring_bell();
+                }
             }
 
             self.poll_disc_change();
@@ -2653,6 +2659,25 @@ impl App {
     }
 }
 
+/// Whether a worker event marks the end of a run the user should be recalled
+/// for. A cancel was their own keypress, so it stays quiet.
+fn rings_bell(event: &WorkerEvent) -> bool {
+    matches!(event, WorkerEvent::RipDone { cancelled: false })
+}
+
+/// Ring the terminal bell, best-effort.
+///
+/// Many terminals render this as a visual bell, disable it, or drop it in tmux,
+/// so this is a nudge rather than a guarantee. stdout is line-buffered and the
+/// bell is not a newline, hence the explicit flush.
+fn ring_bell() {
+    use std::io::Write;
+
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
 // ---------------------------------------------------------------------------
 // Background work
 // ---------------------------------------------------------------------------
@@ -4349,5 +4374,13 @@ mod tests {
         assert_eq!(app.done, 1);
         assert_eq!(app.session_files, 1);
         assert_eq!(app.session_bytes, 1_234);
+    }
+
+    #[test]
+    fn only_a_finished_run_rings_the_bell() {
+        assert!(rings_bell(&WorkerEvent::RipDone { cancelled: false }));
+        // The user pressed q/a themselves, so there is nobody to recall.
+        assert!(!rings_bell(&WorkerEvent::RipDone { cancelled: true }));
+        assert!(!rings_bell(&WorkerEvent::Drives(Vec::new())));
     }
 }

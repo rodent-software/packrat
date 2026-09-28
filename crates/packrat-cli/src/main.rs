@@ -586,6 +586,12 @@ fn rip(
         "Wrote {} packets ({} bytes of payload), {} chapters",
         report.packets, report.payload_bytes, report.chapters
     );
+    if report.unreadable_sectors > 0 {
+        eprintln!(
+            "warning: {} sector(s) could not be read or were skipped; the file has gaps there",
+            report.unreadable_sectors
+        );
+    }
     Ok(())
 }
 
@@ -1136,6 +1142,13 @@ fn split(
             report.packets,
             report.chapters
         );
+        if report.unreadable_sectors > 0 {
+            eprintln!(
+                "warning: {} could not be read in full; {} sector(s) are missing",
+                job.path.display(),
+                report.unreadable_sectors
+            );
+        }
     }
 
     Ok(())

@@ -2603,10 +2603,19 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )
             }
-            JobStatus::Done(report) => Span::styled(
-                format!("✓ {} chapters", report.chapters),
-                Style::default().fg(Color::Green),
-            ),
+            JobStatus::Done(report) => {
+                let damaged = report.unreadable_sectors > 0;
+                let text = if damaged {
+                    format!(
+                        "✓ {} chapters · {} unreadable sector(s)",
+                        report.chapters, report.unreadable_sectors
+                    )
+                } else {
+                    format!("✓ {} chapters", report.chapters)
+                };
+                let color = if damaged { Color::Yellow } else { Color::Green };
+                Span::styled(text, Style::default().fg(color))
+            }
             JobStatus::Failed(e) => Span::styled(format!("✗ {e}"), Style::default().fg(Color::Red)),
             JobStatus::Cancelled => Span::styled("⊘ cancelled", Style::default().fg(Color::Yellow)),
         };
@@ -4368,6 +4377,7 @@ mod tests {
                 packets: 10,
                 payload_bytes: 1_234,
                 chapters: 5,
+                ..Default::default()
             }),
         });
 

@@ -30,6 +30,28 @@ use crate::source::DiscSource;
 
 /// DVD logical sector size.
 const SECTOR: usize = 2048;
+/// Times to retry a VOB sector the drive failed to read before giving up.
+///
+/// Optical drives return transient `EIO` for marginal sectors — a speck of
+/// dust, a light scratch, or a spot just past what the media holds — and a
+/// fresh attempt usually reads the same sector fine. A handful of retries
+/// recovers those without spending the drive's whole error-recovery timeout on
+/// a sector that is never coming back; the kernel's own retries have already
+/// been exhausted by the time a read reaches us.
+const SECTOR_READ_ATTEMPTS: u32 = 3;
+/// Consecutive unreadable sectors before a damaged run is skipped over.
+///
+/// Retrying every sector of a long scratch would spend the drive's error
+/// recovery on each one, so after two failures in a row the walk skips ahead
+/// without probing. An isolated bad spot still costs a single probe.
+const SKIP_CONSECUTIVE_FAILURES: u32 = 2;
+/// First, then maximum, sectors skipped when crossing a damaged run.
+///
+/// The step starts small so little is lost if the damage is short, and grows
+/// (then resets once a readable sector is found) so a long run is crossed in a
+/// few probes rather than one per sector.
+const SKIP_MIN: u64 = 4;
+const SKIP_MAX: u64 = 128;
 /// PES timestamps are in 90 kHz units.
 const PES_TIME_BASE: TimeBase = TimeBase::new(1, 90_000);
 /// Length of the DVD LPCM audio-pack header (including the substream byte).
@@ -44,6 +66,10 @@ pub struct RemuxReport {
     pub payload_bytes: u64,
     /// Number of chapters written.
     pub chapters: u16,
+    /// Sectors missing from the output: the drive could not read them, or they
+    /// were skipped while crossing a damaged run. Non-zero means the rip is
+    /// complete but has glitches there.
+    pub unreadable_sectors: u64,
 }
 
 /// Which pass a remux is currently running.
@@ -318,6 +344,10 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
         .saturating_mul(2)
         .saturating_mul(SECTOR as u64);
     let mut read_bytes = 0u64;
+    // Sectors the drive could not read during muxing: those are the ones the
+    // written file is actually missing. The probe pass discards its own count
+    // so a sector that reads on the second try is not reported as lost.
+    let mut unreadable = 0u64;
     // Output bytes are counted by the writer; nothing is written until pass 2.
     let written_bytes = Arc::new(AtomicU64::new(0));
 
@@ -338,6 +368,9 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
                 written_bytes: 0,
             });
         };
+        // The probe pass must tolerate the same bad spots as muxing, but its
+        // count is not the one reported.
+        let mut probe_unreadable = 0u64;
         for_each_pes(
             reader,
             vts,
@@ -362,6 +395,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
                 Ok(())
             },
             &mut on_sectors,
+            &mut probe_unreadable,
             cancel,
         )?;
     }
@@ -533,6 +567,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
             Ok(())
         },
         &mut on_sectors,
+        &mut unreadable,
         cancel,
     )?;
 
@@ -558,6 +593,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
     replace_file(&temp, out)?;
     guard.defuse();
 
+    report.unreadable_sectors = unreadable;
     Ok(report)
 }
 
@@ -1217,6 +1253,7 @@ fn audio_channels(audio_streams: &[AudioAttributes], track: &Track) -> Option<u1
 
 /// Call `f` for every PES packet across the selected chapters. `on_sectors` is
 /// invoked with the number of sectors just read, so callers can track progress.
+/// Unreadable sectors are skipped and counted in `unreadable`.
 /// Returns [`DiscError::Cancelled`] as soon as `cancel` is set.
 fn for_each_pes<R: Read + Seek>(
     reader: &mut R,
@@ -1224,6 +1261,7 @@ fn for_each_pes<R: Read + Seek>(
     chapters: &[(u16, DvdChapter)],
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
+    unreadable: &mut u64,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), DiscError> {
     for (number, chapter) in chapters {
@@ -1245,6 +1283,7 @@ fn for_each_pes<R: Read + Seek>(
                 cell.last_vobu_end_sector,
                 f,
                 on_sectors,
+                unreadable,
                 cancel,
             )?;
         }
@@ -1272,13 +1311,49 @@ fn count_sectors(vts: &VtsIfo, chapters: &[(u16, DvdChapter)]) -> u64 {
     total
 }
 
+/// Read one chain-relative sector, retrying the drive's transient read errors.
+///
+/// Each attempt re-seeks first: a failed read can leave the previous reader
+/// (device or mount) at an undefined offset, and a fresh seek is what coaxes a
+/// marginal sector out of the drive. Cancellation is honoured between
+/// attempts, so a stubborn sector cannot make the rip ignore the stop key.
+///
+/// `Ok(true)` means the sector was read, `Ok(false)` that the drive refused it
+/// even after retries (the caller skips it rather than failing the rip), and
+/// `Err` that the reader could not seek or the caller cancelled.
+fn read_sector_with_retries<R: Read + Seek>(
+    reader: &mut R,
+    sector: u64,
+    buffer: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, DiscError> {
+    for _ in 0..SECTOR_READ_ATTEMPTS {
+        if cancelled(cancel) {
+            return Err(DiscError::Cancelled);
+        }
+        reader
+            .seek(SeekFrom::Start(sector * SECTOR as u64))
+            .map_err(|e| DiscError::Remux(format!("seek sector {sector}: {e}")))?;
+        if reader.read_exact(buffer).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Walk a contiguous chain-relative sector range, calling `f` for each PES.
+///
+/// Sectors the drive cannot read are skipped and counted in `unreadable`, so a
+/// few bad spots on an otherwise sound disc still yield a complete file. A long
+/// damaged run is crossed by skipping ahead, which keeps a badly scratched disc
+/// from spending minutes of drive error-recovery on every sector of the run.
 fn walk_sectors<R: Read + Seek>(
     reader: &mut R,
     first: u32,
     last: u32,
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
+    unreadable: &mut u64,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), DiscError> {
     if last < first {
@@ -1286,19 +1361,38 @@ fn walk_sectors<R: Read + Seek>(
     }
     let count = u64::from(last - first) + 1;
     let mut buffer = vec![0u8; SECTOR];
+    let mut consecutive_failures = 0u32;
+    let mut skip_remaining = 0u64;
+    let mut skip_step = SKIP_MIN;
 
     for offset in 0..count {
         if cancelled(cancel) {
             return Err(DiscError::Cancelled);
         }
         let sector = u64::from(first) + offset;
-        reader
-            .seek(SeekFrom::Start(sector * SECTOR as u64))
-            .map_err(|e| DiscError::Remux(format!("seek sector {sector}: {e}")))?;
-        reader
-            .read_exact(&mut buffer)
-            .map_err(|e| DiscError::Remux(format!("read sector {sector}: {e}")))?;
+
+        if skip_remaining > 0 {
+            // Inside a run already known to be damaged: advance without asking
+            // the drive about this sector.
+            skip_remaining -= 1;
+            *unreadable += 1;
+            on_sectors(1);
+            continue;
+        }
+
+        let read = read_sector_with_retries(reader, sector, &mut buffer, cancel)?;
         on_sectors(1);
+        if !read {
+            *unreadable += 1;
+            consecutive_failures += 1;
+            if consecutive_failures >= SKIP_CONSECUTIVE_FAILURES {
+                skip_remaining = skip_step;
+                skip_step = (skip_step * 2).min(SKIP_MAX);
+            }
+            continue;
+        }
+        consecutive_failures = 0;
+        skip_step = SKIP_MIN;
 
         if looks_like_nav_pack(&buffer) {
             // Navigation pack — no elementary stream.
@@ -1519,8 +1613,17 @@ mod tests {
         let mut reader = std::io::Cursor::new(Vec::<u8>::new());
         let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
         let mut sectors = |_sectors: u64| {};
+        let mut unreadable = 0u64;
 
-        let result = walk_sectors(&mut reader, 0, 10, &mut pes, &mut sectors, Some(&cancel));
+        let result = walk_sectors(
+            &mut reader,
+            0,
+            10,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            Some(&cancel),
+        );
 
         assert!(matches!(result, Err(DiscError::Cancelled)));
     }
@@ -1531,12 +1634,155 @@ mod tests {
         let mut reader = std::io::Cursor::new(Vec::<u8>::new());
         let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
         let mut sectors = |_sectors: u64| {};
+        let mut unreadable = 0u64;
 
-        // Nothing is cancelled, so it gets as far as reading (and failing on
-        // the empty cursor) rather than stopping short.
-        let result = walk_sectors(&mut reader, 0, 0, &mut pes, &mut sectors, Some(&cancel));
+        // Nothing is cancelled, so the empty cursor's unreadable sector is
+        // skipped and counted instead of aborting.
+        let result = walk_sectors(
+            &mut reader,
+            0,
+            0,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            Some(&cancel),
+        );
 
-        assert!(!matches!(result, Err(DiscError::Cancelled)));
+        assert!(result.is_ok());
+        assert_eq!(unreadable, 1);
+    }
+
+    /// A reader that fails a fixed number of times before serving its data, so
+    /// the retry path can be exercised without a real marginal disc.
+    struct FlakyReader {
+        data: Vec<u8>,
+        remaining_failures: u32,
+        pos: u64,
+    }
+
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err(std::io::Error::other("medium error"));
+            }
+            let start = self.pos as usize;
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - start);
+            buf[..n].copy_from_slice(&self.data[start..start + n]);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for FlakyReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let target = match pos {
+                SeekFrom::Start(p) => p as i64,
+                SeekFrom::Current(delta) => self.pos as i64 + delta,
+                SeekFrom::End(delta) => self.data.len() as i64 + delta,
+            };
+            self.pos = target.max(0) as u64;
+            Ok(self.pos)
+        }
+    }
+
+    /// A sector the drive fails once or twice must still be read: the retry
+    /// re-seeks and tries again rather than failing the whole rip.
+    #[test]
+    fn a_transient_read_error_is_retried_in_place() {
+        let mut data = vec![0u8; 2 * SECTOR];
+        data[SECTOR..SECTOR + 4].copy_from_slice(b"\x00\x00\x01\xba");
+        let mut reader = FlakyReader {
+            data,
+            remaining_failures: SECTOR_READ_ATTEMPTS - 1,
+            pos: 0,
+        };
+        let mut buffer = vec![0u8; SECTOR];
+
+        let read = read_sector_with_retries(&mut reader, 1, &mut buffer, None)
+            .expect("recovers after retries");
+
+        assert!(read);
+        assert_eq!(&buffer[..4], b"\x00\x00\x01\xba");
+    }
+
+    /// A sector that never reads is reported as skipped, not as a fatal error,
+    /// so one bad spot cannot abort the whole rip.
+    #[test]
+    fn a_persistent_read_error_is_skipped() {
+        let mut reader = FlakyReader {
+            data: vec![0u8; SECTOR],
+            remaining_failures: SECTOR_READ_ATTEMPTS,
+            pos: 0,
+        };
+        let mut buffer = vec![0u8; SECTOR];
+
+        let read = read_sector_with_retries(&mut reader, 42, &mut buffer, None)
+            .expect("a failed read is not fatal");
+
+        assert!(!read, "the sector is reported unreadable");
+    }
+
+    /// Fails every read and counts the attempts, so skipping can be told apart
+    /// from probing each sector of a damaged run.
+    struct CountingFailures {
+        attempts: u32,
+        pos: u64,
+    }
+
+    impl std::io::Read for CountingFailures {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            Err(std::io::Error::other("medium error"))
+        }
+    }
+
+    impl std::io::Seek for CountingFailures {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let target = match pos {
+                SeekFrom::Start(p) => p as i64,
+                SeekFrom::Current(delta) => self.pos as i64 + delta,
+                SeekFrom::End(delta) => delta,
+            };
+            self.pos = target.max(0) as u64;
+            Ok(self.pos)
+        }
+    }
+
+    /// A long damaged run must be crossed by skipping, not by spending the
+    /// drive's error-recovery timeout on all 300 sectors.
+    #[test]
+    fn a_damaged_run_is_crossed_by_skipping() {
+        let mut reader = CountingFailures {
+            attempts: 0,
+            pos: 0,
+        };
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut sectors = |_sectors: u64| {};
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            299,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            None,
+        )
+        .expect("a damaged run does not abort the walk");
+
+        assert_eq!(unreadable, 300, "every sector of the run is accounted for");
+        // Probing all 300 sectors would be 900 read attempts; skipping crosses
+        // them in a few dozen.
+        assert!(
+            reader.attempts < 100,
+            "walk probed {} times; expected skipping",
+            reader.attempts
+        );
     }
 
     #[test]

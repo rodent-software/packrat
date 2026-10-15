@@ -29,6 +29,12 @@ pub enum DiscError {
     #[error("CSS decryption unavailable: {0}")]
     Dvdcss(String),
 
+    /// The drive is not ready to answer yet — spinning up, seeking, or busy
+    /// with another command. That is a delay rather than damage, so the read
+    /// paths wait it out instead of writing the sector off as unreadable.
+    #[error("drive not ready: {0}")]
+    NotReady(String),
+
     /// The caller asked the remux to stop; any half-written output is removed.
     #[error("remux cancelled")]
     Cancelled,

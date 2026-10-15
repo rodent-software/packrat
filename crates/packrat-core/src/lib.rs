@@ -21,8 +21,8 @@ pub mod tmdb;
 
 pub use detect::{
     alternates, chapter_pattern, classify, feature_titles, movie_extras, preferred_titles,
-    split_title, AlternateSet, ChapterPattern, Classification, DiscKind, Segment, EPISODE_MAX,
-    EPISODE_MIN, EXTRA_MIN, MIN_CONTENT, MOVIE_MIN,
+    primary_feature, split_title, AlternateSet, ChapterPattern, Classification, DiscKind, Segment,
+    EPISODE_MAX, EPISODE_MIN, EXTRA_MIN, MIN_CONTENT, MOVIE_MIN,
 };
 pub use disc::{read_disc, read_vts, DiscModel, Title};
 pub use drives::OpticalDrive;
@@ -42,6 +42,7 @@ pub use movie::{
     rank as rank_movies, resolve as resolve_movie, MovieQuery, MovieResolution, AUTO_ACCEPT,
     CANDIDATES as MOVIE_CANDIDATES,
 };
+pub use oxideav_dvd::VtsIfo;
 pub use remux::{
     remux_chain, remux_chain_with_progress, remux_chain_with_progress_and_cancel, remux_chapters,
     remux_chapters_with_reader, remux_title, RemuxPhase, RemuxProgress, RemuxReport,

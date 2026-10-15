@@ -8,8 +8,9 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/rodent-software/packrat'
 license=('GPL-3.0-or-later')
 # libdvdcss is only needed to read CSS-encrypted discs; packrat loads it at
-# runtime and works on unencrypted discs without it.
-depends=('libdvdcss')
+# runtime and works on unencrypted discs without it. The rest is the windowing
+# and graphics stack the desktop window needs.
+depends=('libdvdcss' 'libxkbcommon' 'vulkan-icd-loader')
 provides=('packrat')
 conflicts=('packrat')
 options=('!strip')

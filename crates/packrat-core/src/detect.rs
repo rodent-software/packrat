@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::disc::{DiscModel, Title};
-use crate::identify::parse_label;
+use crate::identify::{parse_label, LabelInfo};
 
 /// Titles shorter than this are menus/warnings/previews, not content.
 pub const MIN_CONTENT: Duration = Duration::from_secs(5 * 60);
@@ -100,18 +100,23 @@ pub fn classify(disc: &DiscModel) -> Classification {
     // One dominant long title: a feature film, or a "Play All" season disc.
     if longest_duration >= MOVIE_MIN {
         let segments = split_title(longest);
-        if segments.len() >= 3 {
-            let average = mean_duration(&segments);
-            if is_episode_length(average) {
+        // Chapter runs that could be episodes: enough of them, averaging an
+        // episode's length.
+        let episode_runs = (segments.len() >= 3)
+            .then(|| mean_duration(&segments))
+            .filter(|average| is_episode_length(*average))
+            .map(|_| segments.len());
+
+        if let Some(runs) = episode_runs {
+            if split_corroborated(&segments, longest_duration, &label) {
                 let confidence = if season_label { 80 } else { 70 };
                 return Classification {
                     kind: DiscKind::TvSeries,
                     confidence,
                     reasons: vec![format!(
-                        "longest title ({}) splits into {} episode-length chapter groups (~{} min each){}",
+                        "longest title ({}) splits into {runs} episode-length chapter groups (~{} min each){}",
                         fmt(longest_duration),
-                        segments.len(),
-                        average.as_secs() / 60,
+                        mean_duration(&segments).as_secs() / 60,
                         label_suffix(season_label)
                     )],
                 };
@@ -153,6 +158,53 @@ pub fn classify(disc: &DiscModel) -> Classification {
         if year_label {
             reasons.push("label carries a release year and no season marker".into());
         }
+        if let Some(runs) = episode_runs {
+            // The chapters group into episodes, but a film whose chapters repeat
+            // a rhythm groups the same way and nothing outside the chapter table
+            // separates them. Report the runs so calling it TV is an informed
+            // choice rather than a coincidence.
+            reasons.push(format!(
+                "its chapters also group into {runs} episode-length runs, so choose TV if this is an episodic disc"
+            ));
+        }
+        return Classification {
+            kind: DiscKind::Movie,
+            confidence,
+            reasons,
+        };
+    }
+
+    // Longer than an episode and shorter than a feature: a short film, unless
+    // there are several titles in that range or the label says otherwise. A
+    // lone title here is not an episode — television needs either company or a
+    // label, and calling it one routes a short film through the episode path.
+    if longest_duration > EPISODE_MAX {
+        let comparable = content
+            .iter()
+            .filter(|title| title.duration.is_some_and(|d| d > EPISODE_MAX))
+            .count();
+        if comparable >= 2 || season_label {
+            let confidence = if season_label { 60 } else { 50 };
+            return Classification {
+                kind: DiscKind::TvSeries,
+                confidence,
+                reasons: vec![format!(
+                    "{comparable} titles run longer than an episode and shorter than a feature \
+                     (longest {}){}",
+                    fmt(longest_duration),
+                    label_suffix(season_label)
+                )],
+            };
+        }
+
+        let confidence = if year_label { 70 } else { 55 };
+        let mut reasons = vec![format!(
+            "one title of {}, longer than an episode and the only one of its length",
+            fmt(longest_duration)
+        )];
+        if year_label {
+            reasons.push("label carries a release year and no season marker".into());
+        }
         return Classification {
             kind: DiscKind::Movie,
             confidence,
@@ -191,6 +243,20 @@ pub fn feature_titles(disc: &DiscModel) -> Vec<&Title> {
     features
 }
 
+/// The title treated as the disc's main feature.
+///
+/// Normally the longest feature-length title. A short film has none — it is
+/// under [`MOVIE_MIN`] — so the longest content title stands in, which is what
+/// keeps a disc whose only title is a short film from planning no feature at
+/// all.
+pub fn primary_feature(disc: &DiscModel) -> Option<&Title> {
+    feature_titles(disc).first().copied().or_else(|| {
+        disc.content_titles(MIN_CONTENT)
+            .into_iter()
+            .max_by_key(|title| title.duration.unwrap_or_default())
+    })
+}
+
 /// Bonus content on a movie disc: every title except the main feature that is
 /// long enough to be intentional (menus and warnings are shorter than
 /// [`EXTRA_MIN`]).
@@ -199,7 +265,7 @@ pub fn feature_titles(disc: &DiscModel) -> Vec<&Title> {
 /// short featurettes and trailers, so the selection list can offer everything
 /// that might be worth ripping rather than silently dropping it.
 pub fn movie_extras(disc: &DiscModel) -> Vec<&Title> {
-    let primary = feature_titles(disc).first().map(|t| t.number);
+    let primary = primary_feature(disc).map(|t| t.number);
     let mut extras: Vec<&Title> = disc
         .titles
         .iter()
@@ -255,6 +321,22 @@ pub fn split_title(title: &Title) -> Vec<Segment> {
     }
 
     segments
+}
+
+/// Whether a lone title's chapters really are a run of episodes.
+///
+/// A "Play All" title and a film whose chapters happen to repeat a rhythm look
+/// identical in the chapter table: one title partitioning into equal-sum blocks
+/// of episode length. Nothing in that table separates them, so this asks for
+/// something outside it — a volume label that already says the disc is
+/// television — and for the runs to account for the title rather than only part
+/// of it, which is what a rhythm mistaken for structure tends to do.
+fn split_corroborated(segments: &[Segment], title: Duration, label: &LabelInfo) -> bool {
+    if title.is_zero() || !(label.season.is_some() || label.looks_like_tv) {
+        return false;
+    }
+    let covered: Duration = segments.iter().map(|segment| segment.duration).sum();
+    covered * 100 >= title * 80
 }
 
 /// A set of titles that look like alternate encodings of the same episodes —
@@ -516,6 +598,18 @@ mod tests {
         Duration::from_secs(n)
     }
 
+    /// A one-title disc whose chapters are given in minutes, with a volume
+    /// label of the caller's choosing.
+    fn film(volume_id: &str, chapter_minutes: &[u64]) -> DiscModel {
+        let chapters: Vec<Duration> = chapter_minutes.iter().map(|m| secs(m * 60)).collect();
+        DiscModel {
+            volume_id: volume_id.into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![title_with(chapters)],
+        }
+    }
+
     fn title_with(chapters: Vec<Duration>) -> Title {
         Title {
             number: 1,
@@ -698,6 +792,110 @@ mod tests {
                 .any(|r| r.contains("label names a season")),
             "{:?}",
             result.reasons
+        );
+    }
+
+    /// A lone title longer than an episode is a short film. Television is
+    /// several episodes or a label that says so, and calling a 65-minute film
+    /// an episode routes it through the episode naming path.
+    #[test]
+    fn a_lone_short_film_is_a_movie_not_an_episode() {
+        let disc = film("TEST", &[5; 13]);
+
+        let result = classify(&disc);
+
+        assert_eq!(result.kind, DiscKind::Movie);
+        assert!(
+            result.reasons[0].contains("longer than an episode"),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// Inside the episode band a lone title really is episode-shaped, so TV
+    /// stays the better guess.
+    #[test]
+    fn a_lone_episode_length_title_is_still_tv() {
+        assert_eq!(
+            classify(&film("TEST", &[10, 10, 10])).kind,
+            DiscKind::TvSeries
+        );
+    }
+
+    /// Several titles of that length are episodes of a longer-format series
+    /// rather than one short film.
+    #[test]
+    fn several_titles_longer_than_an_episode_are_tv() {
+        let mut first = title_with(vec![secs(60 * 60)]);
+        let mut second = title_with(vec![secs(60 * 60)]);
+        second.number = 2;
+        second.vts_ttn = 2;
+        first.chapters = 1;
+
+        let disc = DiscModel {
+            volume_id: "TEST".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![first, second],
+        };
+
+        assert_eq!(classify(&disc).kind, DiscKind::TvSeries);
+    }
+
+    /// A film whose chapters repeat a rhythm groups into episode-length runs
+    /// exactly as a "Play All" title does, and the chapter table cannot tell
+    /// them apart. Without a label saying the disc is television it stays a
+    /// movie, with the runs reported so TV can be chosen by hand.
+    #[test]
+    fn a_chapter_rhythm_alone_does_not_split_a_film() {
+        let chapters = [10, 8, 6, 10, 8, 6, 10, 8, 6, 10, 8, 6];
+        let disc = film("TEST", &chapters);
+
+        // The structure really is there: the split finds four runs.
+        assert_eq!(split_title(&disc.titles[0]).len(), 4);
+
+        let result = classify(&disc);
+
+        assert_eq!(result.kind, DiscKind::Movie);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("group into 4 episode-length runs")),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// The same disc with a season on the label is television, and the split is
+    /// the whole point of it.
+    #[test]
+    fn a_season_label_corroborates_splitting_a_play_all_title() {
+        let chapters = [10, 8, 6, 10, 8, 6, 10, 8, 6, 10, 8, 6];
+        let disc = film("SOME_SHOW_S1_D1", &chapters);
+
+        let result = classify(&disc);
+
+        assert_eq!(result.kind, DiscKind::TvSeries);
+        assert!(
+            result.reasons[0].contains("splits into 4 episode-length chapter groups"),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    /// A short film has no feature-length title, so it still has to be found as
+    /// the main feature or the movie path plans nothing at all.
+    #[test]
+    fn a_short_film_is_the_main_feature() {
+        let disc = film("TEST", &[5; 13]);
+
+        let feature = primary_feature(&disc).expect("a main feature");
+
+        assert_eq!(feature.number, 1);
+        assert!(
+            movie_extras(&disc).is_empty(),
+            "the film is not its own extra"
         );
     }
 

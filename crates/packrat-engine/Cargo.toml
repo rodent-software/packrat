@@ -1,0 +1,15 @@
+[package]
+name = "packrat-engine"
+description = "Terminal-independent orchestration for packrat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+packrat-core = { path = "../packrat-core" }
+anyhow.workspace = true
+fs4.workspace = true

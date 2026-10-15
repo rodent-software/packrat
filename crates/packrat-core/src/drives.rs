@@ -5,10 +5,11 @@
 //! `diskutil`; Windows uses `GetLogicalDrives`/`GetDriveTypeW` and the Win32
 //! device APIs. Unsupported platforms report no drives rather than guessing.
 
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// An optical drive and, if there is one, the disc in it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpticalDrive {
     /// Device node, e.g. `/dev/sr0` or `\\.\D:`.
     pub device: PathBuf,
@@ -134,6 +135,31 @@ pub fn eject(device: &Path) -> Result<(), String> {
 /// `CDROMEJECT` from `<linux/cdrom.h>`.
 #[cfg(target_os = "linux")]
 const CDROMEJECT: std::ffi::c_ulong = 0x5309;
+/// `CDROM_DRIVE_STATUS` — `_IOR('c', 0x5A, int)`. Asks the drive for its own
+/// answer about the tray and the media, rather than the kernel's cached idea.
+///
+/// Despite the `_IOR`, the answer comes back as the ioctl's *return value*, not
+/// through the argument: the argument is the slot number to ask about.
+#[cfg(target_os = "linux")]
+const CDROM_DRIVE_STATUS: std::ffi::c_ulong = 0x8004_635A;
+/// `CDSL_CURRENT` — ask about the disc that is in the drive now. A slot number,
+/// which is what this ioctl's argument is, not a pointer.
+#[cfg(target_os = "linux")]
+const CDSL_CURRENT: std::ffi::c_ulong = u64::MAX;
+/// `CDS_NO_DISC` from `CDROM_DRIVE_STATUS`.
+#[cfg(target_os = "linux")]
+const CDS_NO_DISC: i32 = 1;
+/// `CDS_TRAY_OPEN`.
+#[cfg(target_os = "linux")]
+const CDS_TRAY_OPEN: i32 = 2;
+/// `CDS_DRIVE_NOT_READY` — a disc is there, but the drive is not ready to be
+/// read yet. This is what a drive says while it spins up, and it is not an
+/// empty drive.
+#[cfg(target_os = "linux")]
+const CDS_DRIVE_NOT_READY: i32 = 3;
+/// `CDS_DISC_OK`.
+#[cfg(target_os = "linux")]
+const CDS_DISC_OK: i32 = 4;
 /// `CDROM_LOCKDOOR` from `<linux/cdrom.h>`.
 #[cfg(target_os = "linux")]
 const CDROM_LOCKDOOR: std::ffi::c_ulong = 0x5329;
@@ -370,6 +396,105 @@ mod win {
     }
 }
 
+/// What a drive says about its media.
+///
+/// The distinction that matters is between a drive that says it is empty and
+/// one that will not say anything, because only the first is a reason not to
+/// try reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Media {
+    /// The drive holds a disc. `bytes` is 0 where the size is not known.
+    Present { bytes: u64 },
+    /// The drive answered that there is no disc in it.
+    Empty,
+    /// The drive would not say: still spinning up, or no usable answer. A disc
+    /// may well be there, so the read is the only thing that settles it.
+    Unsure(String),
+    /// The device could not be opened at all, so a read cannot be tried either.
+    Unavailable(String),
+}
+
+impl Media {
+    /// The size of the disc, where it is known.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Self::Present { bytes } => *bytes,
+            _ => 0,
+        }
+    }
+}
+
+/// Ask `device` what media it holds.
+///
+/// Asking the drive is the point rather than an overhead. Two things go wrong
+/// when the kernel's cached idea is used instead:
+///
+/// - It is only refreshed when something opens the drive — `/sys/block/sr0/`
+///   `events_poll_msecs` is -1, so it does not poll — and a disc that went in
+///   since reads as absent for as long as nothing asks.
+/// - A disc that is there but not yet spun up is not the same as an empty
+///   drive, and only the drive can tell the two apart.
+///
+/// So `CDROM_DRIVE_STATUS` is asked first: it makes the drive answer for
+/// itself, and it says "not ready" when that is what is happening. The size is
+/// then a bonus, and the kernel's capacity is the fallback where the drive will
+/// not answer at all. The open is non-blocking for the same reason every other
+/// one is: it must not make the kernel close the tray.
+pub fn media(device: &Path) -> Media {
+    #[cfg(unix)]
+    {
+        let mut file = match open_device(device) {
+            Ok(file) => file,
+            Err(e) => {
+                return Media::Unavailable(format!("cannot open {}: {e}", device.display()));
+            }
+        };
+
+        // A capacity is only good news: it means a disc is there. Zero means
+        // the kernel has not been told yet, not that the drive is empty.
+        let bytes = file.seek(SeekFrom::End(0)).unwrap_or(0);
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            // The status is the return value; a negative one is an error.
+            let status = unsafe { ioctl(file.as_raw_fd(), CDROM_DRIVE_STATUS, CDSL_CURRENT) };
+            match status {
+                CDS_DISC_OK => return Media::Present { bytes },
+                CDS_DRIVE_NOT_READY => {
+                    return Media::Unsure("the drive is not ready yet".into());
+                }
+                // Only both sources agreeing that there is nothing means there
+                // is nothing: a drive that says "no disc" while the kernel has
+                // a capacity for one is a drive to try reading, not to skip.
+                CDS_NO_DISC | CDS_TRAY_OPEN if bytes == 0 => return Media::Empty,
+                // `CDS_NO_INFO`, an error, and a disagreement all fall through.
+                _ => {}
+            }
+        }
+
+        if bytes > 0 {
+            Media::Present { bytes }
+        } else {
+            Media::Unsure("the drive did not say".into())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows and the rest already ask the drive when they list drives, so
+        // their answer is the live one — but not a size, hence the 0.
+        if list()
+            .into_iter()
+            .any(|drive| drive.device == device && drive.has_disc)
+        {
+            Media::Present { bytes: 0 }
+        } else {
+            Media::Empty
+        }
+    }
+}
+
 /// All optical drives on the system.
 #[cfg(target_os = "linux")]
 pub fn list() -> Vec<OpticalDrive> {
@@ -561,6 +686,22 @@ mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
+
+    /// A drive that cannot be asked is not an empty drive, and saying so is the
+    /// difference between "put a disc in" and "this drive is not answering".
+    /// Needs a real drive to prove the asking; this pins the failure side.
+    #[test]
+    fn a_device_that_cannot_be_opened_is_not_an_empty_one() {
+        let answer = media(Path::new("/dev/packrat-no-such-drive"));
+
+        match answer {
+            Media::Unavailable(reason) => assert!(
+                reason.contains("packrat-no-such-drive"),
+                "the reason should name the drive: {reason}"
+            ),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
 
     /// The point of [`open_device`] is that the kernel does not autoclose an
     /// open tray; it only does that for blocking opens, so the flag must be

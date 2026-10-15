@@ -1,0 +1,38 @@
+[package]
+name = "packrat"
+description = "A free and open source physical media backup utility"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# The GUI toolkit drives the floor: Iced 0.14 targets Rust 2024.
+rust-version = "1.88"
+
+[package.metadata.wix]
+upgrade-guid = "B6270B47-DE00-4D0E-95CB-5D56E4E0DEE5"
+path-guid = "FF8D58ED-DF85-46B6-96B6-90E9966E689C"
+license = false
+eula = false
+
+[[bin]]
+name = "packrat"
+path = "src/main.rs"
+
+[dependencies]
+packrat-core = { path = "../packrat-core" }
+packrat-engine = { path = "../packrat-engine" }
+# The `tokio` feature supplies the timer subscription the worker channel is
+# drained on; the default `thread-pool` backend has no time module. `fira-sans`
+# bundles a UI font so the window looks the same on every platform.
+iced = { version = "0.14", features = ["tokio", "fira-sans"] }
+# Native folder picker. On Linux this defaults to the XDG desktop portal, so
+# there is no GTK or other native build dependency.
+rfd = "0.17"
+fs4.workspace = true
+
+[dev-dependencies]
+# Renders each screen to a PNG headlessly, so layouts can be reviewed without
+# opening a window.
+iced_test = "0.14"

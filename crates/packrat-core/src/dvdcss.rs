@@ -223,32 +223,67 @@ impl Dvdcss {
         Ok(Self { api, handle })
     }
 
-    /// Read one 2048-byte, decrypted sector at absolute disc LBA `lba`.
-    pub fn read_sector(&mut self, lba: u64, buf: &mut [u8; 2048]) -> Result<(), DiscError> {
-        let blocks =
-            c_int::try_from(lba).map_err(|_| DiscError::Remux("LBA out of range".into()))?;
-        let seeked = unsafe { (self.api.seek)(self.handle, blocks, 0) };
-        if seeked < 0 {
-            return Err(DiscError::Remux(format!(
-                "dvdcss_seek({lba}): {}",
-                self.error()
-            )));
-        }
+    /// Read `buf.len() / 2048` consecutive, decrypted sectors from `lba`.
+    ///
+    /// One `dvdcss_read` covers the whole span. Each call becomes a single
+    /// request on the drive, and a drive answers a command in roughly a
+    /// millisecond whatever its size, so asking for one 2 KiB sector at a time
+    /// runs the rip at the drive's command rate — about 2 MB/s — instead of at
+    /// its media rate.
+    ///
+    /// `buf` must hold a whole number of sectors.
+    pub fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), DiscError> {
+        debug_assert!(!buf.is_empty() && buf.len() % 2048 == 0);
+        let blocks = buf.len() / 2048;
+        let blocks = c_int::try_from(blocks)
+            .map_err(|_| DiscError::Remux("read window out of range".into()))?;
+
+        self.seek_blocks(lba)?;
+
         let read = unsafe {
             (self.api.read)(
                 self.handle,
                 buf.as_mut_ptr() as *mut c_void,
-                1,
+                blocks,
                 DVDCSS_READ_DECRYPT,
             )
         };
-        if read != 1 {
-            return Err(DiscError::Remux(format!(
-                "dvdcss_read({lba}): {}",
-                self.error()
-            )));
+        if read != blocks {
+            // Read errno before `dvdcss_error`, which may itself make calls.
+            let source = std::io::Error::last_os_error();
+            return Err(self.failure(source, format!("dvdcss_read({lba}, {blocks} blocks)")));
         }
         Ok(())
+    }
+
+    /// Position the handle at absolute disc LBA `lba`.
+    fn seek_blocks(&mut self, lba: u64) -> Result<(), DiscError> {
+        let blocks =
+            c_int::try_from(lba).map_err(|_| DiscError::Remux("LBA out of range".into()))?;
+        let seeked = unsafe { (self.api.seek)(self.handle, blocks, 0) };
+        if seeked < 0 {
+            let source = std::io::Error::last_os_error();
+            return Err(self.failure(source, format!("dvdcss_seek({lba})")));
+        }
+        Ok(())
+    }
+
+    /// Describe a libdvdcss failure, keeping "the drive is busy, ask again"
+    /// distinct from real damage.
+    ///
+    /// The device is opened `O_NONBLOCK`, so a drive answers `EAGAIN` while it
+    /// spins up or seeks. Reporting that as an ordinary read failure would have
+    /// the remuxer skip a perfectly good sector — and, after two in a row, skip
+    /// a run of them — so it has to survive as [`DiscError::NotReady`], which
+    /// the read paths translate back into an `io::ErrorKind::WouldBlock` they
+    /// wait out.
+    fn failure(&self, source: std::io::Error, what: String) -> DiscError {
+        let message = format!("{what}: {}", self.error());
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            DiscError::NotReady(message)
+        } else {
+            DiscError::Remux(message)
+        }
     }
 
     fn error(&self) -> String {

@@ -86,8 +86,8 @@ Only raw-device reads of a CSS-scrambled disc need the library.
 
 ## Enabling CSS decryption
 
-Install `libdvdcss` from your distribution or package manager, then confirm that
-packrat finds it with [`packrat doctor`](#checking-your-setup).
+Install `libdvdcss` from your distribution or package manager. packrat checks
+for it when it starts: if it cannot find it, the window tells you so.
 
 ### Linux
 
@@ -162,17 +162,8 @@ PACKRAT_DVDCSS=/opt/lib packrat
 
 ## Checking your setup
 
-```sh
-packrat doctor
-```
-
-It reports the platform and whether CSS decryption is available, along with the
-path of the library it found. When the library is missing it explains why and
-where to get it. A working setup looks like:
-
-```text
-packrat  : 0.1.0
-platform : linux (x86_64)
-css      : available
-libdvdcss: /usr/lib/x86_64-linux-gnu/libdvdcss.so.2
-```
+packrat checks for `libdvdcss` when it starts. When it cannot find it, the
+window shows a note explaining that CSS-encrypted discs cannot be read, and
+[Enabling CSS decryption](#enabling-css-decryption) above covers where to get
+it. Unencrypted discs, extracted `VIDEO_TS` folders and disc images that are
+already decrypted are unaffected.

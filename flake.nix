@@ -18,13 +18,26 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
           # libdvdcss is supplied by nixpkgs, never bundled. Point the runtime
-          # loader at it on Linux; macOS users can set PACKRAT_DVDCSS.
-          buildInputs = pkgs.lib.optional pkgs.stdenv.isLinux pkgs.libdvdcss;
+          # loader at it on Linux; macOS users can set PACKRAT_DVDCSS. The rest
+          # is the windowing and graphics stack the Iced window needs.
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.libdvdcss
+            pkgs.libxkbcommon
+            pkgs.vulkan-loader
+            pkgs.wayland
+            pkgs.libX11
+          ];
           postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             wrapProgram "$out/bin/packrat" \
-              --prefix PACKRAT_DVDCSS : "${pkgs.libdvdcss}/lib"
+              --prefix PACKRAT_DVDCSS : "${pkgs.libdvdcss}/lib" \
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [
+                pkgs.vulkan-loader
+                pkgs.libxkbcommon
+                pkgs.wayland
+                pkgs.libX11
+              ]}"
           '';
 
           meta = with pkgs.lib; {
@@ -61,7 +74,13 @@
               pkgs.rustfmt
               pkgs.clippy
               pkgs.pkg-config
-            ] ++ pkgs.lib.optional pkgs.stdenv.isLinux pkgs.libdvdcss;
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.libdvdcss
+              pkgs.libxkbcommon
+              pkgs.vulkan-loader
+              pkgs.wayland
+              pkgs.libX11
+            ];
           };
         });
     };

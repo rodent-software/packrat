@@ -6,6 +6,23 @@ cd packrat
 cargo build
 ```
 
+## Layout
+
+The workspace is three crates:
+
+- `packrat-core` — disc I/O: optical device access, DVD-Video structure parsing,
+  CSS decryption and remuxing. It has no UI and no user preferences.
+- `packrat-engine` — orchestration between core and the window: saved settings,
+  TVmaze/TMDb matching, planning a disc into the list of files to write, and the
+  background worker threads. It has no graphical assumptions.
+- `packrat-gui` — the `packrat` binary: the Iced desktop application, split into
+  state and update logic (`main.rs`), the per-file model (`jobs.rs`) and the
+  screen layouts (`view.rs`).
+
+Planning decisions belong in `packrat-engine` rather than a screen, so the flow
+stays testable without a display and the layouts cannot disagree about which
+files a disc produces.
+
 ## libdvdcss
 
 packrat never links or bundles `libdvdcss`; it loads the copy you install at

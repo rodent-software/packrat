@@ -33,7 +33,15 @@ enum Backend {
     Plain(File),
     /// Decrypted reads through the user-supplied libdvdcss.
     Dvdcss(crate::dvdcss::Dvdcss),
+    /// Test double that records the requests it is handed, so a test can assert
+    /// how many device requests a read produced and how large they were.
+    #[cfg(test)]
+    Recording(RecordedRequests),
 }
+
+/// Requests recorded by the test backend, as `(lba, bytes)`.
+#[cfg(test)]
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(u64, usize)>>>;
 
 impl DeviceChainReader {
     /// Open `device` and find the start of `VTS_xx_1.VOB`, the origin for the
@@ -124,13 +132,41 @@ impl Backend {
     }
 
     fn read_sector(&mut self, lba: u64, buf: &mut [u8; SECTOR]) -> io::Result<()> {
+        self.read_range(lba, buf)
+    }
+
+    /// Read whole sectors in a single request.
+    ///
+    /// `buf` must hold a whole number of sectors. One request per span is what
+    /// lets the drive stream: a 2 KiB request per sector is answered at the
+    /// drive's command rate, roughly a millisecond each, which pins a rip near
+    /// 2 MB/s however fast the media is.
+    fn read_range(&mut self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+        debug_assert!(!buf.is_empty() && buf.len() % SECTOR == 0);
         match self {
             Backend::Plain(file) => {
                 file.seek(SeekFrom::Start(lba * SECTOR as u64))?;
                 file.read_exact(buf)
             }
-            Backend::Dvdcss(css) => css.read_sector(lba, buf).map_err(io::Error::other),
+            Backend::Dvdcss(css) => css.read_blocks(lba, buf).map_err(from_disc_error),
+            #[cfg(test)]
+            Backend::Recording(requests) => {
+                requests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((lba, buf.len()));
+                Ok(())
+            }
         }
+    }
+}
+
+/// Keep "the drive is not ready yet" a retryable `WouldBlock` all the way out
+/// to the remuxer, which waits it out rather than treating it as damage.
+fn from_disc_error(error: DiscError) -> io::Error {
+    match error {
+        DiscError::NotReady(message) => io::Error::new(io::ErrorKind::WouldBlock, message),
+        other => io::Error::other(other),
     }
 }
 
@@ -143,6 +179,23 @@ impl Read for DeviceChainReader {
         while written < buf.len() {
             let sector = self.base_lba + self.pos / SECTOR as u64;
             let offset = (self.pos % SECTOR as u64) as usize;
+
+            // A sector-aligned span goes to the drive as one request. The
+            // sector cache below only has to serve the unaligned head or tail
+            // of a request, which the remuxer never produces because it reads
+            // whole windows, but the `Read` contract requires supporting.
+            if offset == 0 {
+                let whole = (buf.len() - written) / SECTOR;
+                if whole > 0 {
+                    let bytes = whole * SECTOR;
+                    self.backend
+                        .read_range(sector, &mut buf[written..written + bytes])?;
+                    written += bytes;
+                    self.pos += bytes as u64;
+                    continue;
+                }
+            }
+
             let take = (SECTOR - offset).min(buf.len() - written);
             let data = self.sector(sector)?;
             buf[written..written + take].copy_from_slice(&data[offset..offset + take]);
@@ -221,5 +274,66 @@ mod tests {
         let disc = disc_with(vec![vob(3, 1, 10), vob(4, 2, 20), vob(4, 1, 30)]);
         assert_eq!(absolute_vts_base(&disc, 262, 4), Some(292));
         assert_eq!(absolute_vts_base(&disc, 262, 5), None);
+    }
+
+    /// A reader whose backend records what it is asked for.
+    fn recording() -> (RecordedRequests, DeviceChainReader) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = DeviceChainReader {
+            backend: Backend::Recording(requests.clone()),
+            base_lba: 100,
+            pos: 0,
+            cache: Box::new([0u8; SECTOR]),
+            cache_lba: None,
+        };
+        (requests, reader)
+    }
+
+    fn requests_of(requests: &RecordedRequests) -> Vec<(u64, usize)> {
+        requests.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A read spanning many sectors must reach the drive as one request. Asking
+    /// per sector is what pins a rip at the drive's command rate — about 2 MB/s
+    /// — instead of letting its media rate through.
+    #[test]
+    fn a_multi_sector_read_becomes_one_device_request() {
+        let (requests, mut reader) = recording();
+        let mut buf = vec![0u8; 64 * SECTOR];
+
+        reader.read_exact(&mut buf).expect("read the window");
+
+        assert_eq!(requests_of(&requests), vec![(100, 64 * SECTOR)]);
+    }
+
+    /// A request that starts and ends mid-sector still hands the drive its
+    /// whole aligned body as one request, instead of dropping to one request
+    /// per sector for the bulk of it.
+    #[test]
+    fn an_unaligned_read_only_splits_its_edges() {
+        let (requests, mut reader) = recording();
+        reader.seek(SeekFrom::Start(10)).expect("seek");
+        let mut buf = vec![0u8; 32 * SECTOR + 10];
+
+        reader.read_exact(&mut buf).expect("read");
+
+        // The head costs the sector it starts in, the 31 whole sectors in the
+        // middle arrive in a single request, and the tail costs its sector.
+        assert_eq!(
+            requests_of(&requests),
+            vec![(100, SECTOR), (101, 31 * SECTOR), (132, SECTOR)],
+        );
+    }
+
+    /// "The drive is not ready yet" has to stay retryable all the way out to
+    /// the remuxer, which waits a `WouldBlock` out instead of writing the
+    /// sector off as unreadable.
+    #[test]
+    fn a_not_ready_drive_becomes_a_retryable_would_block() {
+        let not_ready = from_disc_error(DiscError::NotReady("spinning up".into()));
+        assert_eq!(not_ready.kind(), std::io::ErrorKind::WouldBlock);
+
+        let damage = from_disc_error(DiscError::Remux("medium error".into()));
+        assert_eq!(damage.kind(), std::io::ErrorKind::Other);
     }
 }

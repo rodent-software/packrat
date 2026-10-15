@@ -87,6 +87,38 @@ pub fn search_show(title: &str) -> Result<Option<Show>, MetaError> {
     }
 }
 
+/// Search for shows by name, best match first.
+///
+/// TVmaze's `search` endpoint answers with a ranked list where the
+/// `singlesearch` one the resolver uses commits to a single answer. A list is
+/// what a person can choose from when the disc label is wrong, abbreviated, or
+/// names something several shows share.
+pub fn search_shows(title: &str) -> Result<Vec<(f64, Show)>, MetaError> {
+    let url = format!("{TVMAZE}/search/shows?q={}", encode(title));
+    match ureq::get(&url).call() {
+        Ok(response) => response
+            .into_body()
+            .read_json::<Vec<SearchResult>>()
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|result| (result.score, result.show))
+                    .collect()
+            })
+            .map_err(|e| MetaError::Json(e.to_string())),
+        Err(ureq::Error::StatusCode(404)) => Ok(Vec::new()),
+        Err(e) => Err(MetaError::Http(e.to_string())),
+    }
+}
+
+/// One entry of TVmaze's `search/shows` response.
+#[derive(Debug, Deserialize)]
+struct SearchResult {
+    #[serde(default)]
+    score: f64,
+    show: Show,
+}
+
 /// Every episode of a show, across all seasons.
 pub fn episodes(show_id: u32) -> Result<Vec<Episode>, MetaError> {
     let url = format!("{TVMAZE}/shows/{show_id}/episodes");
@@ -487,6 +519,35 @@ mod tests {
             number: Some(number),
             runtime: Some(runtime),
         }
+    }
+
+    /// A search answers with several shows, not one, which is the whole point
+    /// of the endpoint the search box uses over the resolver's single-search.
+    #[test]
+    fn parses_a_show_search_response() {
+        let json = r#"[
+            {"score": 0.94, "show": {"id": 1, "name": "Dragon Ball", "premiered": "1986-02-26"}},
+            {"score": 0.71, "show": {"id": 2, "name": "Dragon Ball GT", "premiered": "1996-02-07"}}
+        ]"#;
+
+        let results: Vec<SearchResult> = serde_json::from_str(json).expect("parse");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].score, 0.94);
+        assert_eq!(results[0].show.name, "Dragon Ball");
+        assert_eq!(results[0].show.year(), Some(1986));
+        assert_eq!(results[1].show.year(), Some(1996));
+    }
+
+    /// A result with no premiere date still parses, since TVmaze leaves the
+    /// field out for shows that have not aired.
+    #[test]
+    fn a_search_result_without_a_date_parses() {
+        let json = r#"[{"score": 1.0, "show": {"id": 3, "name": "Unannounced"}}]"#;
+
+        let results: Vec<SearchResult> = serde_json::from_str(json).expect("parse");
+
+        assert_eq!(results[0].show.year(), None);
     }
 
     fn named_episode(season: u32, number: u32, name: &str, runtime: u32) -> Episode {

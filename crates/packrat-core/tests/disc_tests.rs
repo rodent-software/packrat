@@ -31,7 +31,7 @@ fn discover_accepts_disc_root() {
     fs::write(root.join("VIDEO_TS/VIDEO_TS.IFO"), b"x").unwrap();
 
     let source = DiscSource::discover(&root).expect("disc root should be accepted");
-    assert_eq!(source.video_ts(), root.join("VIDEO_TS"));
+    assert_eq!(source.video_ts(), Some(root.join("VIDEO_TS").as_path()));
     assert!(source.main_ifo().is_some());
 
     let _ = fs::remove_dir_all(&root);
@@ -194,11 +194,23 @@ fn progress_reports_probe_then_muxing() {
         .expect("muxing phase reported");
     assert!(first_probe < first_mux, "probe precedes muxing");
 
-    let bytes_total = events[0].2;
-    assert!(bytes_total > 0, "total bytes are known up front");
+    // The probe stops as soon as the IFO's stream list is confirmed, so how
+    // much of the title it reads is only known once it finishes: the total
+    // starts as the two-pass estimate and is revised down once, before muxing.
+    let mux_totals: Vec<u64> = events
+        .iter()
+        .skip(first_mux)
+        .map(|(_, _, total)| *total)
+        .collect();
     assert!(
-        events.iter().all(|(_, _, total)| *total == bytes_total),
-        "total stays stable across the run"
+        mux_totals.windows(2).all(|w| w[0] == w[1]),
+        "the total is settled before muxing starts"
+    );
+    let bytes_total = *mux_totals.first().expect("muxing reported progress");
+    assert!(bytes_total > 0, "total bytes are known before muxing");
+    assert!(
+        events.iter().all(|(_, _, total)| *total >= bytes_total),
+        "the total is only ever revised down from the two-pass estimate"
     );
     assert!(
         events.windows(2).all(|w| w[0].1 <= w[1].1),
@@ -227,8 +239,9 @@ fn device_reads_match_folder_reads() {
         return;
     };
 
+    let mount_path = std::path::PathBuf::from(&mount);
     let folder = DiscSource::discover(&mount).expect("open folder");
-    let raw = DiscSource::discover_device(&device, &mount).expect("open device source");
+    let raw = DiscSource::discover_device(&device, Some(&mount_path)).expect("open device source");
     let disc = read_disc(&folder).expect("read disc");
     let title = disc
         .titles
@@ -244,6 +257,14 @@ fn device_reads_match_folder_reads() {
     remux_chain(&raw, &vts, &title, 1, title.chapters, &b).expect("device remux");
 
     assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+
+    // The same disc with no mount at all: the IFO files come off the device's
+    // own filesystem, so an automounter is not required.
+    let unmounted = DiscSource::discover_device(&device, None).expect("device-only source");
+    let from_device = read_disc(&unmounted).expect("read structure from the device alone");
+    assert_eq!(from_device.titles.len(), disc.titles.len());
+    assert_eq!(from_device.titles[0].chapters, disc.titles[0].chapters);
+    read_vts(&unmounted, title.vts).expect("read VTS from the device alone");
 
     let _ = fs::remove_file(&a);
     let _ = fs::remove_file(&b);

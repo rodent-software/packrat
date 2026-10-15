@@ -8,6 +8,9 @@
 # The binary is built without libdvdcss, so the packages only *recommend* the
 # library rather than requiring it: packrat works on unencrypted discs without
 # it, and the user's distribution supplies it where it can.
+#
+# The window needs a windowing and graphics stack at runtime. Those are
+# recommended too, so a headless machine can still install the package.
 name: packrat
 arch: ${ARCH}
 platform: linux
@@ -32,6 +35,10 @@ overrides:
   deb:
     recommends:
       - libdvd-pkg
+      - libxkbcommon0
+      - libvulkan1
   rpm:
     recommends:
       - libdvdcss
+      - libxkbcommon
+      - vulkan-loader

@@ -21,7 +21,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # libdvdcss is never linked: packrat loads the user's copy at runtime, so
-      # there is no native build dependency on any runner.
+      # there is no native build dependency for it. The window does need the
+      # usual X11/Wayland development packages to link on Linux.
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
       - name: Build
         run: cargo build --workspace --verbose
       - name: Test

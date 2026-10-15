@@ -19,8 +19,9 @@ use oxideav_dvd::vob::{
     SC_PADDING_STREAM, SC_PRIVATE_STREAM_1, SC_PRIVATE_STREAM_2, SC_SYSTEM_HEADER,
 };
 use oxideav_dvd::{
-    Ac3Header, AspectRatioCode, AudioAttributes, AudioSubstreamHeader, DtsHeader, DvdChapter,
-    DvdTitle, PictureCodingExtension, PictureHeader, PictureStructure, SequenceHeader, VtsIfo,
+    Ac3Header, AspectRatioCode, AudioAttributes, AudioCodingMode, AudioStreamControl,
+    AudioSubstreamHeader, DtsHeader, DvdChapter, DvdTitle, PictureCodingExtension, PictureHeader,
+    PictureStructure, SequenceHeader, SubpictureStreamControl, VtsIfo,
 };
 use oxideav_mkv::mux::{MkvMuxer, MkvVideoGeometry};
 
@@ -30,6 +31,21 @@ use crate::source::DiscSource;
 
 /// DVD logical sector size.
 const SECTOR: usize = 2048;
+/// Sectors fetched from the drive in one request while walking a chain.
+///
+/// A drive answers a command in roughly a millisecond whether it asks for one
+/// sector or a hundred, so a request per 2 KiB sector spends nearly all its
+/// time on command turnaround and pins a rip near 2 MB/s whatever the disc's
+/// rated speed. A window per request amortises that away and lets the media
+/// rate set the pace.
+///
+/// 128 sectors (256 KiB) leaves command turnaround a few percent of the time
+/// budget rather than the fifth or so that 64 KiB still spends on it, and stays
+/// well inside the 1 MiB the drive accepts in one request. Bigger windows trade
+/// against damage: a window the drive refuses costs one failed request and then
+/// its sectors are read one at a time, so an over-large window would widen that
+/// fallback for no further gain.
+const READ_WINDOW_SECTORS: u64 = 128;
 /// Times to retry a VOB sector the drive failed to read before giving up.
 ///
 /// Optical drives return transient `EIO` for marginal sectors — a speck of
@@ -39,6 +55,27 @@ const SECTOR: usize = 2048;
 /// a sector that is never coming back; the kernel's own retries have already
 /// been exhausted by the time a read reaches us.
 const SECTOR_READ_ATTEMPTS: u32 = 3;
+/// How many times a "not ready" answer is waited out before giving up.
+///
+/// The device is opened `O_NONBLOCK` so probing a drive cannot make the kernel
+/// close its tray, and that flag also applies to the reads. On Linux an optical
+/// drive answers `EAGAIN` while it spins up or seeks, which is a delay rather
+/// than a bad sector. With the backoff below, this many attempts wait about
+/// five seconds before treating the disc as damaged.
+const NOT_READY_ATTEMPTS: u32 = 100;
+/// How long to wait after the first "not ready" answer.
+const NOT_READY_DELAY_MIN: std::time::Duration = std::time::Duration::from_millis(2);
+/// The longest a single "not ready" wait grows to.
+const NOT_READY_DELAY_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+/// How many times the wait doubles before it stops growing.
+const NOT_READY_BACKOFF_STEPS: u32 = 5;
+/// Unreadable packs tolerated in one cell before the rip gives up.
+///
+/// A pack that will not parse is usually a single odd spot on the disc, and
+/// skipping it costs a few frames. A run of them means the sectors are not the
+/// ones the IFO described, which skipping cannot fix, so past this many the
+/// error is the honest answer.
+const MALFORMED_IN_CELL_MAX: u64 = 64;
 /// Consecutive unreadable sectors before a damaged run is skipped over.
 ///
 /// Retrying every sector of a long scratch would spend the drive's error
@@ -76,6 +113,10 @@ pub struct RemuxReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemuxPhase {
     /// Reading the title to discover its elementary streams (nothing written).
+    ///
+    /// This pass stops as soon as it has confirmed the streams the IFO
+    /// declares, so it usually reads only the start of the title; it runs to
+    /// the end only when the IFO cannot be trusted to list them.
     Probing,
     /// Writing packets to the output.
     Muxing,
@@ -83,18 +124,20 @@ pub enum RemuxPhase {
 
 /// A progress snapshot emitted while a remux runs.
 ///
-/// A remux reads the title twice — once to discover its streams, once to mux
-/// them — so `bytes_done`/`bytes_total` span both passes and a throughput or
-/// time estimate is available from the very first sector. `written_bytes`
-/// separates the disc read side from the output write side, so a caller can
-/// tell which one is the bottleneck.
+/// `bytes_done`/`bytes_total` span the probe pass and muxing, so a throughput
+/// or time estimate is available from the very first sector. How much of the
+/// title the probe reads is only known once it finishes, so `bytes_total` is
+/// the two-pass estimate while probing and is then revised down to the work the
+/// rip will really do. `written_bytes` separates the disc read side from the
+/// output write side, so a caller can tell which one is the bottleneck.
 #[derive(Debug, Clone, Copy)]
 pub struct RemuxProgress {
     /// The pass currently running.
     pub phase: RemuxPhase,
     /// VOB bytes read so far, across both passes.
     pub bytes_done: u64,
-    /// VOB bytes that will be read across both passes.
+    /// VOB bytes that will be read, across both passes. Settled once muxing
+    /// begins.
     pub bytes_total: u64,
     /// Bytes handed to the output writer so far.
     pub written_bytes: u64,
@@ -120,7 +163,10 @@ pub fn remux_chapters(
     last: u16,
     out: &Path,
 ) -> Result<RemuxReport, DiscError> {
-    let mut reader = VtsChainReader::open(source.video_ts(), title.vts)?;
+    let video_ts = source
+        .video_ts()
+        .ok_or_else(|| DiscError::NoVideoTs(source.root().display().to_string()))?;
+    let mut reader = VtsChainReader::open(video_ts, title.vts)?;
     remux_chapters_with_reader(&mut reader, vts, title, first, last, out)
 }
 
@@ -185,7 +231,10 @@ fn remux_chain_impl(
 ) -> Result<RemuxReport, DiscError> {
     match source {
         DiscSource::Folder { .. } => {
-            let mut reader = VtsChainReader::open(source.video_ts(), title.vts)?;
+            let video_ts = source
+                .video_ts()
+                .ok_or_else(|| DiscError::NoVideoTs(source.root().display().to_string()))?;
+            let mut reader = VtsChainReader::open(video_ts, title.vts)?;
             remux_chapters_with_reader_progress_cancel(
                 &mut reader,
                 vts,
@@ -217,11 +266,13 @@ fn remux_chain_impl(
                     cancel,
                 ),
                 Err(device_error) => {
-                    let mut reader = match VtsChainReader::open(source.video_ts(), title.vts) {
+                    // Without a mount there is nothing to fall back to, and the
+                    // device failure names the filesystem that could not be read.
+                    let Some(video_ts) = source.video_ts() else {
+                        return Err(device_error);
+                    };
+                    let mut reader = match VtsChainReader::open(video_ts, title.vts) {
                         Ok(reader) => reader,
-                        // Neither medium can supply the chain: report the
-                        // device failure, since that names the filesystem that
-                        // could not be read.
                         Err(_) => return Err(device_error),
                     };
                     remux_chapters_with_reader_progress_cancel(
@@ -306,6 +357,12 @@ pub fn remux_chapters_with_reader_progress<R: Read + Seek>(
 }
 
 /// The cancel-aware implementation behind the public remux entry points.
+///
+/// The probe pass stops as soon as it has confirmed the stream list the IFO
+/// declares, which turns the usual two reads of the title into one. A title
+/// that turns out to carry a stream its IFO does not list is re-read the long
+/// way rather than ripped short, so the shortcut can only cost reads, never
+/// streams.
 #[allow(clippy::too_many_arguments)]
 fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
     reader: &mut R,
@@ -315,6 +372,60 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
     last: u16,
     out: &Path,
     progress: &mut dyn FnMut(RemuxProgress),
+    cancel: Option<&AtomicBool>,
+) -> Result<RemuxReport, DiscError> {
+    let mut probe_incomplete = false;
+    match remux_once(
+        reader,
+        vts,
+        title,
+        first,
+        last,
+        out,
+        &mut *progress,
+        true,
+        &mut probe_incomplete,
+        cancel,
+    ) {
+        Err(_) if probe_incomplete => {
+            eprintln!(
+                "packrat: this title carries a stream its IFO does not declare; \
+                 re-reading it in full"
+            );
+            let mut unused = false;
+            remux_once(
+                reader,
+                vts,
+                title,
+                first,
+                last,
+                out,
+                &mut *progress,
+                false,
+                &mut unused,
+                cancel,
+            )
+        }
+        result => result,
+    }
+}
+
+/// One attempt at a remux.
+///
+/// `optimistic_probe` allows the probe pass to stop once the IFO's stream list
+/// is confirmed. `probe_incomplete` is set when that shortcut turned out to be
+/// wrong, telling the caller a full re-read is worth trying.
+#[allow(clippy::too_many_arguments)]
+fn remux_once<R: Read + Seek>(
+    reader: &mut R,
+    vts: &VtsIfo,
+    title: &Title,
+    first: u16,
+    last: u16,
+    out: &Path,
+    progress: &mut dyn FnMut(RemuxProgress),
+    optimistic_probe: bool,
+    probe_incomplete: &mut bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<RemuxReport, DiscError> {
     if cancelled(cancel) {
@@ -339,17 +450,28 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
     }
     let selected = chapters_in_range(dvd_title, first, last);
 
-    // Both passes read the whole title, so total work is two chain lengths.
-    let bytes_total = count_sectors(vts, &selected)
-        .saturating_mul(2)
-        .saturating_mul(SECTOR as u64);
+    // One pass over the selected chapters, plus however much of it the probe
+    // pass has to read to learn the streams — known only once it finishes, and
+    // corrected below.
+    let planned_bytes = count_sectors(vts, &selected).saturating_mul(SECTOR as u64);
+    let mut bytes_total = planned_bytes.saturating_mul(2);
     let mut read_bytes = 0u64;
     // Sectors the drive could not read during muxing: those are the ones the
     // written file is actually missing. The probe pass discards its own count
     // so a sector that reads on the second try is not reported as lost.
     let mut unreadable = 0u64;
-    // Output bytes are counted by the writer; nothing is written until pass 2.
+    // Output bytes are counted by the writer; nothing is written until muxing.
     let written_bytes = Arc::new(AtomicU64::new(0));
+
+    // The streams the IFO says the selected chapters carry. Reading the whole
+    // title just to learn this costs a second pass over the disc, which is half
+    // the rip; the PGC's stream-control table already states it, so the probe
+    // only has to run until it has seen all of them — usually the first seconds
+    // of the title. Anything that makes that list untrustworthy falls back to
+    // reading the title out, so the shortcut can only cost reads.
+    let declared = declared_tracks(vts, &selected);
+    let mut trustworthy = optimistic_probe && !declared.is_empty();
+    let stop = AtomicBool::new(false);
 
     // Pass 1: discover the elementary streams, because Matroska's `Tracks`
     // element must be written before the first packet. The video sequence
@@ -377,6 +499,12 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
             &selected,
             &mut |pes| {
                 if let Some(track) = Track::from_pes(&pes) {
+                    if !declared.is_empty() && !declared.contains(&track) {
+                        // The title carries a stream the IFO does not list, so
+                        // its list cannot be used to decide when the stream set
+                        // is complete. Keep probing to the end.
+                        trustworthy = false;
+                    }
                     if !tracks.contains(&track) {
                         tracks.push(track);
                     }
@@ -392,11 +520,21 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
                         }
                     }
                 }
+                if probe_confirmed(trustworthy, &declared, &tracks) {
+                    // Everything the IFO promised has now been seen and nothing
+                    // it did not promise has turned up, so the stream set is
+                    // settled and the rest of the title does not have to be read
+                    // twice.
+                    stop.store(true, Ordering::Relaxed);
+                }
                 Ok(())
             },
             &mut on_sectors,
             &mut probe_unreadable,
-            cancel,
+            WalkFlags {
+                stop: Some(&stop),
+                cancel,
+            },
         )?;
     }
     if cancelled(cancel) {
@@ -406,6 +544,33 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
         return Err(DiscError::Remux("title has no playable streams".into()));
     }
     tracks.sort();
+
+    // The probe only reads as far as it had to, so the real amount of work is
+    // known now. Correcting the total here keeps the reported fraction from
+    // running past its end.
+    bytes_total = read_bytes.saturating_add(planned_bytes);
+    progress(RemuxProgress {
+        phase: RemuxPhase::Probing,
+        bytes_done: read_bytes,
+        bytes_total,
+        written_bytes: 0,
+    });
+
+    // Which way the probe went is the difference between reading the title once
+    // and reading it twice, and it turns on what the disc declares, so say it.
+    let probed = read_bytes / SECTOR as u64;
+    let planned = planned_bytes / SECTOR as u64;
+    if read_bytes < planned_bytes {
+        eprintln!(
+            "packrat: IFO's stream list confirmed after {probed} of {planned} sectors; \
+             reading the title once"
+        );
+    } else {
+        eprintln!(
+            "packrat: IFO's stream list was not enough to settle the streams; \
+             reading all {planned} sectors before muxing"
+        );
+    }
 
     let video_index = tracks.iter().position(|t| matches!(t, Track::Video));
     let audio_streams = &vts.mat.title_attributes.audio_streams;
@@ -514,11 +679,15 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
             let Some(track) = Track::from_pes(&pes) else {
                 return Ok(());
             };
-            let stream_index = tracks
-                .iter()
-                .position(|t| *t == track)
-                .ok_or_else(|| DiscError::Remux("stream missing from probe pass".into()))?
-                as u32;
+            let stream_index = tracks.iter().position(|t| *t == track).ok_or_else(|| {
+                // Reached only when the probe was cut short on the IFO's
+                // word: the title carries a stream that list left out. Say
+                // so, and let the caller read the title out properly.
+                if optimistic_probe {
+                    *probe_incomplete = true;
+                }
+                DiscError::Remux("stream missing from probe pass".into())
+            })? as u32;
 
             // AC-3 / DTS PES packets carry a substream header whose
             // FirstAccUnit field points at the frame the PES timestamp
@@ -568,7 +737,7 @@ fn remux_chapters_with_reader_progress_cancel<R: Read + Seek>(
         },
         &mut on_sectors,
         &mut unreadable,
-        cancel,
+        WalkFlags { stop: None, cancel },
     )?;
 
     // Flush the final frame each assembler is still holding.
@@ -661,6 +830,87 @@ fn chapters_in_range(title: &DvdTitle, first: u16, last: u16) -> Vec<(u16, DvdCh
         .map(|(i, ch)| ((i + 1) as u16, ch.clone()))
         .filter(|(number, _)| *number >= first && *number <= last)
         .collect()
+}
+
+/// The elementary streams the IFO declares for the selected chapters.
+///
+/// A PGC's stream-control table (`PGC_AST_CTL` / `PGC_SPST_CTL`) states which
+/// streams the title carries, which is what lets the probe pass stop as soon as
+/// it has seen them instead of reading the whole title to find out. The VTS's
+/// audio attributes give each physical stream's coding mode, so a declared
+/// stream can be named exactly as the probe names the ones it finds.
+///
+/// An empty result means the IFO cannot be used as the standard for this title
+/// and the caller must read it out. That is what a coding mode this code cannot
+/// name gets, because guessing would put the wrong codec on a track.
+fn declared_tracks(vts: &VtsIfo, chapters: &[(u16, DvdChapter)]) -> Vec<Track> {
+    let mut tracks = Vec::new();
+    let audio_streams = &vts.mat.title_attributes.audio_streams;
+
+    for (_, chapter) in chapters {
+        let Some(pgc) = vts.pgcs.get(usize::from(chapter.pgcn).wrapping_sub(1)) else {
+            return Vec::new();
+        };
+        if !declared_from_controls(
+            &pgc.audio_stream_control,
+            &pgc.subpicture_stream_control,
+            audio_streams,
+            &mut tracks,
+        ) {
+            return Vec::new();
+        }
+    }
+
+    // A DVD-Video title carries video, and the probe names every video stream
+    // `Track::Video`, so it is declared once.
+    tracks.push(Track::Video);
+    tracks.sort();
+    tracks.dedup();
+    tracks
+}
+
+/// Add the streams one PGC declares, naming each as [`Track::from_pes`] would.
+///
+/// `false` means a stream could not be named, so the declaration cannot be used
+/// as the standard the probe is held to.
+fn declared_from_controls(
+    audio: &[AudioStreamControl],
+    subpictures: &[SubpictureStreamControl],
+    audio_streams: &[AudioAttributes],
+    out: &mut Vec<Track>,
+) -> bool {
+    for control in audio.iter().filter(|control| control.available) {
+        // The control table maps a logical stream onto the physical substream a
+        // demuxer sees, and the VTS's audio attributes are indexed by that
+        // physical number.
+        let index = control.stream_number;
+        match audio_streams.get(usize::from(index)).map(|a| a.coding_mode) {
+            Some(AudioCodingMode::Ac3) => out.push(Track::Ac3(index)),
+            Some(AudioCodingMode::Dts) => out.push(Track::Dts(index)),
+            Some(AudioCodingMode::Lpcm) => out.push(Track::Lpcm(index)),
+            _ => return false,
+        }
+    }
+
+    for control in subpictures.iter().filter(|control| control.available) {
+        // A logical sub-picture stream resolves to a different physical
+        // substream per display mode, and the VOB carries whichever the player
+        // asks for, so every mode's substream is declared. Modes commonly share
+        // one substream, which is one track rather than four.
+        let mut modes = vec![
+            control.stream_4x3,
+            control.stream_wide,
+            control.stream_letterbox,
+            control.stream_pan_scan,
+        ];
+        modes.sort_unstable();
+        modes.dedup();
+        for substream in modes {
+            out.push(Track::Subpicture(substream));
+        }
+    }
+
+    true
 }
 
 /// Elementary stream carried by a DVD title.
@@ -1251,6 +1501,43 @@ fn audio_channels(audio_streams: &[AudioAttributes], track: &Track) -> Option<u1
         .filter(|channels| *channels > 0)
 }
 
+/// How a walk should end, beyond reaching its last sector.
+///
+/// The two flags are named apart rather than passed as two bare options because
+/// they sit next to each other in every call: transposing them would silently
+/// turn a clean stop into an abandoned rip, or the reverse.
+#[derive(Clone, Copy, Default)]
+struct WalkFlags<'a> {
+    /// The caller has everything it needs, so the rest of the walk is not worth
+    /// reading. Unlike cancelling, stopping leaves a usable result.
+    stop: Option<&'a AtomicBool>,
+    /// The caller has abandoned the work.
+    cancel: Option<&'a AtomicBool>,
+}
+
+/// Whether the caller has asked a walk to stop early.
+///
+/// Distinct from cancellation: stopping means the result so far is the one that
+/// was wanted, so the walk ends cleanly. Cancelling abandons the work.
+fn stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+}
+
+/// Whether the probe has seen every stream the IFO declared, while still
+/// trusting the IFO at all.
+///
+/// Once this holds nothing later in the title can change the stream set, so the
+/// rest of it does not have to be read a second time. Neither half may be
+/// dropped: a set that is merely *so far* complete stops early on a disc whose
+/// streams are all at the front, and one that ignores trust stops early on a
+/// disc that has already contradicted its own IFO.
+fn probe_confirmed(trustworthy: bool, declared: &[Track], discovered: &[Track]) -> bool {
+    trustworthy
+        && declared
+            .iter()
+            .all(|declared| discovered.contains(declared))
+}
+
 /// Call `f` for every PES packet across the selected chapters. `on_sectors` is
 /// invoked with the number of sectors just read, so callers can track progress.
 /// Unreadable sectors are skipped and counted in `unreadable`.
@@ -1262,11 +1549,14 @@ fn for_each_pes<R: Read + Seek>(
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
     unreadable: &mut u64,
-    cancel: Option<&AtomicBool>,
+    flags: WalkFlags<'_>,
 ) -> Result<(), DiscError> {
     for (number, chapter) in chapters {
-        if cancelled(cancel) {
+        if cancelled(flags.cancel) {
             return Err(DiscError::Cancelled);
+        }
+        if stopped(flags.stop) {
+            return Ok(());
         }
         let pgc = vts
             .pgcs
@@ -1284,7 +1574,7 @@ fn for_each_pes<R: Read + Seek>(
                 f,
                 on_sectors,
                 unreadable,
-                cancel,
+                flags,
             )?;
         }
     }
@@ -1311,6 +1601,20 @@ fn count_sectors(vts: &VtsIfo, chapters: &[(u16, DvdChapter)]) -> u64 {
     total
 }
 
+/// How long to wait after the `n`th consecutive "not ready" answer.
+///
+/// Short at first, so a drive that is ready almost immediately is not held back
+/// by a sleep far longer than the wait it was covering, and backing off so a
+/// drive that is genuinely spinning up is not hammered with commands while it
+/// works. A flat wait cannot be both: at a rate low enough to be negligible per
+/// occurrence, a rip that hits the answer repeatedly loses more to sleeping
+/// than to the drive.
+fn not_ready_delay(attempts: u32) -> std::time::Duration {
+    NOT_READY_DELAY_MIN
+        .saturating_mul(1u32 << attempts.min(NOT_READY_BACKOFF_STEPS))
+        .min(NOT_READY_DELAY_MAX)
+}
+
 /// Read one chain-relative sector, retrying the drive's transient read errors.
 ///
 /// Each attempt re-seeks first: a failed read can leave the previous reader
@@ -1327,18 +1631,192 @@ fn read_sector_with_retries<R: Read + Seek>(
     buffer: &mut [u8],
     cancel: Option<&AtomicBool>,
 ) -> Result<bool, DiscError> {
-    for _ in 0..SECTOR_READ_ATTEMPTS {
+    let mut failures = 0;
+    let mut not_ready = 0;
+
+    loop {
         if cancelled(cancel) {
             return Err(DiscError::Cancelled);
         }
         reader
             .seek(SeekFrom::Start(sector * SECTOR as u64))
             .map_err(|e| DiscError::Remux(format!("seek sector {sector}: {e}")))?;
-        if reader.read_exact(buffer).is_ok() {
-            return Ok(true);
+
+        meter::attempt(buffer.len());
+        match reader.read_exact(buffer) {
+            Ok(()) => return Ok(true),
+            // A drive that is not ready yet is a delay, not damage. Waiting it
+            // out is what stops a slow spin-up from being recorded as a run of
+            // unreadable sectors.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && not_ready < NOT_READY_ATTEMPTS => {
+                not_ready += 1;
+                meter::not_ready();
+                report_read_failure(sector, "not ready", &e);
+                std::thread::sleep(not_ready_delay(not_ready));
+            }
+            Err(e) => {
+                failures += 1;
+                meter::failed();
+                report_read_failure(sector, "failed", &e);
+                if failures >= SECTOR_READ_ATTEMPTS {
+                    return Ok(false);
+                }
+            }
         }
     }
-    Ok(false)
+}
+
+/// Read `count` consecutive chain-relative sectors in one request.
+///
+/// `Ok(false)` means the drive refused the span, and the caller falls back to
+/// reading its sectors one at a time so the retry and skip policy judges each
+/// on its own. "Not ready" is waited out in here, because that is the drive
+/// asking for time rather than reporting damage.
+fn read_window<R: Read + Seek>(
+    reader: &mut R,
+    first: u64,
+    count: usize,
+    buffer: &mut [u8],
+    cancel: Option<&AtomicBool>,
+) -> Result<bool, DiscError> {
+    debug_assert_eq!(buffer.len(), count * SECTOR);
+    let mut not_ready = 0;
+
+    loop {
+        if cancelled(cancel) {
+            return Err(DiscError::Cancelled);
+        }
+        reader
+            .seek(SeekFrom::Start(first * SECTOR as u64))
+            .map_err(|e| DiscError::Remux(format!("seek sector {first}: {e}")))?;
+
+        meter::attempt(buffer.len());
+        match reader.read_exact(buffer) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock && not_ready < NOT_READY_ATTEMPTS => {
+                not_ready += 1;
+                meter::not_ready();
+                std::thread::sleep(not_ready_delay(not_ready));
+            }
+            // A refused window is routine: the caller reads these sectors
+            // individually and reports the failure from there.
+            Err(_) => return Ok(false),
+        }
+    }
+}
+
+/// Counters for the requests a rip makes of the drive.
+///
+/// The number that matters is the mean request size. A drive answers one
+/// command in roughly a millisecond whatever its size, so a request per 2 KiB
+/// sector pins a rip near 2 MB/s however fast the media is, while a windowed
+/// read lets the media rate through. Reporting it says which of those is
+/// happening, from the rip itself rather than by inference.
+mod meter {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How much reading accumulates between reports.
+    const INTERVAL: Duration = Duration::from_secs(5);
+
+    #[derive(Default)]
+    struct Totals {
+        /// When the window being measured started; `None` before the first
+        /// request.
+        started: Option<Instant>,
+        requests: u64,
+        bytes: u64,
+        not_ready: u64,
+        failures: u64,
+    }
+
+    static TOTALS: Mutex<Option<Totals>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut Totals) -> R) -> R {
+        let mut guard = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(Totals::default))
+    }
+
+    /// Record one request handed to the drive, reporting the rate once enough
+    /// has accumulated.
+    pub(super) fn attempt(bytes: usize) {
+        let line = with(|t| {
+            let started = *t.started.get_or_insert_with(Instant::now);
+            t.requests += 1;
+            t.bytes += bytes as u64;
+
+            let elapsed = started.elapsed();
+            if elapsed < INTERVAL {
+                return None;
+            }
+            let line = summary(
+                t.requests,
+                t.bytes,
+                t.not_ready,
+                t.failures,
+                elapsed.as_secs_f64(),
+            );
+            *t = Totals {
+                started: Some(Instant::now()),
+                ..Totals::default()
+            };
+            Some(line)
+        });
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The line describing what has been read so far.
+    ///
+    /// Split out from the recording so the arithmetic — in particular the mean
+    /// request size that says whether windowing is working — can be checked
+    /// without waiting for a report to fall due.
+    pub(super) fn summary(
+        requests: u64,
+        bytes: u64,
+        not_ready: u64,
+        failures: u64,
+        seconds: f64,
+    ) -> String {
+        let mib = bytes as f64 / (1024.0 * 1024.0);
+        format!(
+            "packrat: read {mib:.1} MiB in {seconds:.1} s ({:.1} MiB/s) over {requests} requests, \
+             mean {} B/request, {not_ready} not-ready waits, {failures} read failures",
+            mib / seconds,
+            bytes / requests.max(1),
+        )
+    }
+
+    /// Record a "not ready" answer that had to be waited out.
+    pub(super) fn not_ready() {
+        with(|t| t.not_ready += 1);
+    }
+
+    /// Record a read the drive refused.
+    pub(super) fn failed() {
+        with(|t| t.failures += 1);
+    }
+}
+
+/// Report a read failure on stderr, a bounded number of times.
+///
+/// A rip that crawls and a badly scratched disc look identical in the counters,
+/// so say what the drive actually answered. Bounded because a damaged run can
+/// produce thousands of these.
+fn report_read_failure(sector: u64, what: &str, error: &io::Error) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const FIRST: u64 = 10;
+    const EVERY: u64 = 200;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen < FIRST {
+        eprintln!("packrat: sector {sector} {what}: {error}");
+    } else if seen % EVERY == 0 {
+        eprintln!("packrat: {seen} read failures so far; latest sector {sector} {what}: {error}");
+    }
 }
 
 /// Walk a contiguous chain-relative sector range, calling `f` for each PES.
@@ -1347,6 +1825,13 @@ fn read_sector_with_retries<R: Read + Seek>(
 /// few bad spots on an otherwise sound disc still yield a complete file. A long
 /// damaged run is crossed by skipping ahead, which keeps a badly scratched disc
 /// from spending minutes of drive error-recovery on every sector of the run.
+///
+/// Healthy stretches are read a [`READ_WINDOW_SECTORS`]-sector window at a
+/// time. Asking the drive for one 2 KiB sector per request runs the rip at the
+/// drive's command rate rather than its media rate, which is what holds a DVD
+/// near 2 MB/s. A window the drive refuses is dropped and its sectors are read
+/// one at a time instead, so the retry and skip policy below still judges an
+/// individual sector rather than condemning a whole window.
 fn walk_sectors<R: Read + Seek>(
     reader: &mut R,
     first: u32,
@@ -1354,20 +1839,29 @@ fn walk_sectors<R: Read + Seek>(
     f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
     on_sectors: &mut dyn FnMut(u64),
     unreadable: &mut u64,
-    cancel: Option<&AtomicBool>,
+    flags: WalkFlags<'_>,
 ) -> Result<(), DiscError> {
     if last < first {
         return Ok(());
     }
     let count = u64::from(last - first) + 1;
     let mut buffer = vec![0u8; SECTOR];
+    let mut window = vec![0u8; READ_WINDOW_SECTORS as usize * SECTOR];
+    // Chain-relative first sector the window holds. A `window_len` of zero
+    // means it holds nothing and the next sector has to be fetched.
+    let mut window_first = 0u64;
+    let mut window_len = 0u64;
     let mut consecutive_failures = 0u32;
+    let mut malformed = 0u64;
     let mut skip_remaining = 0u64;
     let mut skip_step = SKIP_MIN;
 
     for offset in 0..count {
-        if cancelled(cancel) {
+        if cancelled(flags.cancel) {
             return Err(DiscError::Cancelled);
+        }
+        if stopped(flags.stop) {
+            return Ok(());
         }
         let sector = u64::from(first) + offset;
 
@@ -1380,7 +1874,34 @@ fn walk_sectors<R: Read + Seek>(
             continue;
         }
 
-        let read = read_sector_with_retries(reader, sector, &mut buffer, cancel)?;
+        // Only read ahead while the walk is healthy; once the drive starts
+        // refusing sectors every one goes through `read_sector_with_retries`.
+        let mut in_window =
+            window_len > 0 && sector >= window_first && sector < window_first + window_len;
+        if !in_window && consecutive_failures == 0 {
+            let want = (count - offset).min(READ_WINDOW_SECTORS) as usize;
+            if read_window(
+                reader,
+                sector,
+                want,
+                &mut window[..want * SECTOR],
+                flags.cancel,
+            )? {
+                window_first = sector;
+                window_len = want as u64;
+                in_window = true;
+            } else {
+                window_len = 0;
+            }
+        }
+
+        let read = if in_window {
+            let at = (sector - window_first) as usize * SECTOR;
+            buffer.copy_from_slice(&window[at..at + SECTOR]);
+            true
+        } else {
+            read_sector_with_retries(reader, sector, &mut buffer, flags.cancel)?
+        };
         on_sectors(1);
         if !read {
             *unreadable += 1;
@@ -1394,42 +1915,94 @@ fn walk_sectors<R: Read + Seek>(
         consecutive_failures = 0;
         skip_step = SKIP_MIN;
 
-        if looks_like_nav_pack(&buffer) {
-            // Navigation pack — no elementary stream.
-            let _ = NavPack::parse(&buffer);
-            continue;
-        }
-
-        let pack = PackHeader::parse(&buffer)
-            .map_err(|e| DiscError::Remux(format!("pack header: {e}")))?;
-        let mut cursor = PackHeader::SIZE + pack.stuffing_bytes as usize;
-
-        while cursor + 6 <= buffer.len() {
-            if buffer[cursor..cursor + 3] != [0x00, 0x00, 0x01] {
-                break;
+        if let Err(error) = for_each_pack_pes(&buffer, f) {
+            // One pack that will not parse costs a few frames, not the film, so
+            // it is skipped and counted the way an unreadable sector is. A run
+            // of them is not a bad pack but the wrong sectors entirely, which no
+            // amount of skipping fixes, so past a limit the error stands.
+            malformed += 1;
+            *unreadable += 1;
+            report_malformed(sector, &buffer, &error);
+            if malformed > MALFORMED_IN_CELL_MAX {
+                return Err(DiscError::Remux(format!(
+                    "sector {sector} is not a readable MPEG pack, and neither were the \
+                     {malformed} before it: {error}"
+                )));
             }
-            let stream_id = buffer[cursor + 3];
-            if matches!(
-                stream_id,
-                SC_SYSTEM_HEADER | SC_PADDING_STREAM | SC_PRIVATE_STREAM_2
-            ) {
-                let len = ((buffer[cursor + 4] as usize) << 8) | buffer[cursor + 5] as usize;
-                cursor += 6 + len;
-                continue;
-            }
-
-            let wire_size = {
-                let pes = PesPacket::parse(&buffer[cursor..])
-                    .map_err(|e| DiscError::Remux(format!("PES: {e}")))?;
-                let wire_size = pes.wire_size;
-                f(pes)?;
-                wire_size
-            };
-            cursor += wire_size;
         }
     }
 
     Ok(())
+}
+
+/// Hand every PES packet of one pack to `f`.
+///
+/// A pack is one sector and a DVD holds whole PES packets in each, so a pack
+/// can be read on its own. A nav pack carries no elementary stream; anything
+/// else that cannot be read as MPEG-2 programme stream is handed back to the
+/// caller as an error rather than guessed at.
+fn for_each_pack_pes(
+    sector: &[u8],
+    f: &mut dyn FnMut(PesPacket<'_>) -> Result<(), DiscError>,
+) -> Result<(), DiscError> {
+    if looks_like_nav_pack(sector) {
+        // Navigation pack — no elementary stream.
+        let _ = NavPack::parse(sector);
+        return Ok(());
+    }
+
+    let pack =
+        PackHeader::parse(sector).map_err(|e| DiscError::Remux(format!("pack header: {e}")))?;
+    let mut cursor = PackHeader::SIZE + pack.stuffing_bytes as usize;
+
+    while cursor + 6 <= sector.len() {
+        if sector[cursor..cursor + 3] != [0x00, 0x00, 0x01] {
+            break;
+        }
+        let stream_id = sector[cursor + 3];
+        if matches!(
+            stream_id,
+            SC_SYSTEM_HEADER | SC_PADDING_STREAM | SC_PRIVATE_STREAM_2
+        ) {
+            let len = ((sector[cursor + 4] as usize) << 8) | sector[cursor + 5] as usize;
+            cursor += 6 + len;
+            continue;
+        }
+
+        let wire_size = {
+            let pes = PesPacket::parse(&sector[cursor..])
+                .map_err(|e| DiscError::Remux(format!("PES: {e}")))?;
+            let wire_size = pes.wire_size;
+            f(pes)?;
+            wire_size
+        };
+        cursor += wire_size;
+    }
+
+    Ok(())
+}
+
+/// Report a pack that could not be read, a bounded number of times.
+///
+/// The bytes matter more than the count: they say whether this is a mangled
+/// pack or something else entirely, which is the difference between a disc
+/// authored oddly and the wrong sectors being read.
+fn report_malformed(sector: u64, bytes: &[u8], error: &DiscError) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const FIRST: u64 = 10;
+    const EVERY: u64 = 200;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen >= FIRST && seen % EVERY != 0 {
+        return;
+    }
+    let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    eprintln!(
+        "packrat: sector {sector} is not a readable pack ({error}); first bytes {}",
+        head.join(" ")
+    );
 }
 
 /// Presents `VTS_xx_1.VOB`…`VTS_xx_9.VOB` as one contiguous byte stream.
@@ -1622,7 +2195,10 @@ mod tests {
             &mut pes,
             &mut sectors,
             &mut unreadable,
-            Some(&cancel),
+            WalkFlags {
+                stop: None,
+                cancel: Some(&cancel),
+            },
         );
 
         assert!(matches!(result, Err(DiscError::Cancelled)));
@@ -1645,7 +2221,10 @@ mod tests {
             &mut pes,
             &mut sectors,
             &mut unreadable,
-            Some(&cancel),
+            WalkFlags {
+                stop: None,
+                cancel: Some(&cancel),
+            },
         );
 
         assert!(result.is_ok());
@@ -1687,6 +2266,24 @@ mod tests {
             self.pos = target.max(0) as u64;
             Ok(self.pos)
         }
+    }
+
+    /// The "not ready" wait has to start short and back off: a flat wait either
+    /// costs far more than the delay it covers, or hammers a drive that is
+    /// still spinning up.
+    #[test]
+    fn the_not_ready_wait_starts_short_and_backs_off() {
+        use std::time::Duration;
+
+        assert_eq!(not_ready_delay(1), Duration::from_millis(4));
+        assert_eq!(not_ready_delay(2), Duration::from_millis(8));
+        // It stops growing at the cap rather than running away.
+        assert_eq!(not_ready_delay(5), NOT_READY_DELAY_MAX);
+        assert_eq!(not_ready_delay(100), NOT_READY_DELAY_MAX);
+        assert!(
+            not_ready_delay(1) < not_ready_delay(3),
+            "the wait grows with consecutive answers"
+        );
     }
 
     /// A sector the drive fails once or twice must still be read: the retry
@@ -1771,7 +2368,7 @@ mod tests {
             &mut pes,
             &mut sectors,
             &mut unreadable,
-            None,
+            WalkFlags::default(),
         )
         .expect("a damaged run does not abort the walk");
 
@@ -1840,5 +2437,476 @@ mod tests {
         assert_eq!(units[0].data, frame);
         assert_eq!(units[0].pts, Some(48_000));
         assert_eq!(units[0].duration, Some(2880));
+    }
+
+    /// A sector the walk recognises as a navigation pack, so it routes nowhere
+    /// and parsing it cannot fail. Lets a walk be exercised without fabricating
+    /// a whole elementary stream.
+    fn nav_pack() -> Vec<u8> {
+        let mut sector = vec![0u8; SECTOR];
+        sector[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[0x0E..0x12].copy_from_slice(&[0x00, 0x00, 0x01, 0xBB]);
+        sector[0x26..0x2A].copy_from_slice(&[0x00, 0x00, 0x01, 0xBF]);
+        sector[0x400..0x404].copy_from_slice(&[0x00, 0x00, 0x01, 0xBF]);
+        sector[0x406] = 0x01;
+        sector
+    }
+
+    /// A pack whose header is well formed but whose payload is video
+    /// elementary stream rather than the PES packet a pack should start with.
+    /// This is the shape of the `byte-6 top bits != 10` failure: a real
+    /// `00 00 01` followed by a picture start code, which is not a PES header.
+    fn malformed_pack() -> Vec<u8> {
+        let mut sector = vec![0u8; SECTOR];
+        // A valid MPEG-2 pack header: start code, marker bits, a non-zero
+        // mux_rate, no stuffing.
+        sector[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        sector[4] = 0x44;
+        sector[6] = 0x04;
+        sector[8] = 0x04;
+        sector[9] = 0x01;
+        sector[11] = 0x01;
+        sector[12] = 0x03;
+        // Then a picture start code where a PES header belongs.
+        sector[14..18].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        sector
+    }
+
+    /// The pack reader says what it found rather than guessing: a nav pack
+    /// holds no packets, and a payload that is not a PES header is an error.
+    #[test]
+    fn the_pack_reader_reports_what_it_found() {
+        let mut packets = 0;
+        for_each_pack_pes(&nav_pack(), &mut |_pes: PesPacket<'_>| {
+            packets += 1;
+            Ok(())
+        })
+        .expect("a nav pack");
+        assert_eq!(packets, 0);
+
+        let error = for_each_pack_pes(&malformed_pack(), &mut |_pes: PesPacket<'_>| Ok(()))
+            .expect_err("a pack that does not start with a PES packet");
+        assert!(error.to_string().contains("MPEG-1 framing"), "{error}");
+    }
+
+    /// A reader that serves `pack` for every sector it is asked for.
+    fn repeating(pack: &[u8], sectors: usize) -> FlakyReader {
+        let mut data = Vec::with_capacity(pack.len() * sectors);
+        for _ in 0..sectors {
+            data.extend_from_slice(pack);
+        }
+        FlakyReader {
+            data,
+            remaining_failures: 0,
+            pos: 0,
+        }
+    }
+
+    /// A pack that will not parse costs a few frames, not the whole film, so it
+    /// is skipped and counted the way an unreadable sector is.
+    #[test]
+    fn a_pack_that_will_not_parse_is_skipped() {
+        let mut reader = repeating(&malformed_pack(), 10);
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut walked = 0u64;
+        let mut sectors = |n: u64| walked += n;
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            9,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            WalkFlags::default(),
+        )
+        .expect("one bad pack is not fatal");
+
+        assert_eq!(walked, 10, "a skipped pack is still walked past");
+        assert_eq!(unreadable, 10, "and counted as missing from the output");
+    }
+
+    /// A whole cell of packs that will not parse is not a bad pack but the
+    /// wrong sectors, and reporting success would be a lie.
+    #[test]
+    fn a_cell_of_packs_that_will_not_parse_is_an_error() {
+        let mut reader = repeating(&malformed_pack(), 200);
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut sectors = |_n: u64| {};
+        let mut unreadable = 0u64;
+
+        let result = walk_sectors(
+            &mut reader,
+            0,
+            199,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            WalkFlags::default(),
+        );
+
+        let error = result.expect_err("past the limit the error stands");
+        assert!(
+            error.to_string().contains("not a readable MPEG pack"),
+            "{error}"
+        );
+    }
+
+    /// Serves navigation packs and records the size of every request it is
+    /// given, so the number of device requests a walk makes can be counted.
+    struct RequestCounter {
+        data: Vec<u8>,
+        pos: u64,
+        requests: Vec<usize>,
+    }
+
+    impl RequestCounter {
+        fn new(sectors: usize) -> Self {
+            let pack = nav_pack();
+            let mut data = Vec::with_capacity(sectors * SECTOR);
+            for _ in 0..sectors {
+                data.extend_from_slice(&pack);
+            }
+            Self {
+                data,
+                pos: 0,
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for RequestCounter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.requests.push(buf.len());
+            let start = self.pos as usize;
+            if start >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - start);
+            buf[..n].copy_from_slice(&self.data[start..start + n]);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for RequestCounter {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let target = match pos {
+                SeekFrom::Start(p) => p as i64,
+                SeekFrom::Current(delta) => self.pos as i64 + delta,
+                SeekFrom::End(delta) => self.data.len() as i64 + delta,
+            };
+            self.pos = target.max(0) as u64;
+            Ok(self.pos)
+        }
+    }
+
+    /// A healthy walk asks the drive for a window at a time, not a sector at a
+    /// time. The request count is what decides whether a rip runs at the
+    /// drive's command rate or at its media rate, so this is the regression
+    /// that matters most.
+    #[test]
+    fn a_healthy_walk_reads_a_window_per_request() {
+        let window = READ_WINDOW_SECTORS as usize;
+        // Two whole windows and a part, so the last request is a short one.
+        let sectors = window * 2 + 5;
+        let mut reader = RequestCounter::new(sectors);
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut sectors_cb = |_sectors: u64| {};
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            sectors as u32 - 1,
+            &mut pes,
+            &mut sectors_cb,
+            &mut unreadable,
+            WalkFlags::default(),
+        )
+        .expect("walk");
+
+        assert_eq!(unreadable, 0);
+        // One request per window, not one per sector.
+        assert_eq!(
+            reader.requests,
+            vec![window * SECTOR, window * SECTOR, 5 * SECTOR],
+        );
+    }
+
+    /// A window the drive refuses must not cost the whole span: its sectors are
+    /// read one at a time, so the retry and skip policy still judges each on
+    /// its own and only the bad one is written off.
+    #[test]
+    fn a_refused_window_falls_back_to_reading_sectors_one_at_a_time() {
+        /// Refuses anything larger than a sector, as a drive with damage in
+        /// every window would, and fails one nominated sector.
+        struct WindowRefusing {
+            pack: Vec<u8>,
+            pos: u64,
+            bad_sector: u64,
+        }
+
+        impl std::io::Read for WindowRefusing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.len() > SECTOR || self.pos / SECTOR as u64 == self.bad_sector {
+                    return Err(std::io::Error::other("medium error"));
+                }
+                let n = buf.len().min(self.pack.len());
+                buf[..n].copy_from_slice(&self.pack[..n]);
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+
+        impl std::io::Seek for WindowRefusing {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.pos = match pos {
+                    SeekFrom::Start(p) => p,
+                    SeekFrom::Current(delta) => (self.pos as i64 + delta).max(0) as u64,
+                    SeekFrom::End(_) => 0,
+                };
+                Ok(self.pos)
+            }
+        }
+
+        let mut reader = WindowRefusing {
+            pack: nav_pack(),
+            pos: 0,
+            bad_sector: 5,
+        };
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut walked = 0u64;
+        let mut sectors = |n: u64| walked += n;
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            9,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            WalkFlags::default(),
+        )
+        .expect("walk");
+
+        // Every sector is accounted for, and only the bad one is written off.
+        assert_eq!(walked, 10);
+        assert_eq!(unreadable, 1);
+    }
+
+    /// The meter is what tells a windowed read apart from a sector-at-a-time
+    /// one, so its arithmetic has to be right: a mean request size that is
+    /// quietly wrong would send anyone reading it after the wrong cause.
+    #[test]
+    fn the_read_meter_reports_the_mean_request_size_and_rate() {
+        let line = meter::summary(32, 32 * 64 * 1024, 0, 0, 4.0);
+
+        // 2 MiB over 32 requests in 4 s is 64 KiB per request at 0.5 MiB/s.
+        assert!(line.contains("2.0 MiB in 4.0 s (0.5 MiB/s)"), "{line}");
+        assert!(
+            line.contains("over 32 requests, mean 65536 B/request"),
+            "{line}"
+        );
+    }
+
+    /// An audio-attribute field carrying `coding_mode`, the 3-bit selector in
+    /// byte 0 bits 7..5 (0 = AC-3, 4 = LPCM, 6 = DTS).
+    fn attribute(coding_mode: u8) -> AudioAttributes {
+        AudioAttributes::parse(&[coding_mode << 5, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    /// Every coding mode the remuxer can name has to come out of the IFO as the
+    /// same track the probe would name, or the two sets can never be compared.
+    #[test]
+    fn declared_audio_streams_are_named_as_the_probe_names_them() {
+        let mut controls = [AudioStreamControl {
+            available: false,
+            stream_number: 0,
+        }; 8];
+        controls[0] = AudioStreamControl {
+            available: true,
+            stream_number: 0,
+        };
+        // Stream 1 is unavailable even though the title's slot maps it to 2.
+        controls[1] = AudioStreamControl {
+            available: false,
+            stream_number: 2,
+        };
+        controls[2] = AudioStreamControl {
+            available: true,
+            stream_number: 2,
+        };
+        let attributes = [attribute(0), attribute(4), attribute(6)];
+        let mut out = Vec::new();
+
+        assert!(declared_from_controls(
+            &controls,
+            &[],
+            &attributes,
+            &mut out
+        ));
+        assert_eq!(out, vec![Track::Ac3(0), Track::Dts(2)]);
+    }
+
+    /// A sub-picture stream resolves to a different physical substream per
+    /// display mode and the VOB carries whichever the player asks for, so every
+    /// mode's substream is declared.
+    #[test]
+    fn declared_subpicture_streams_cover_every_display_mode() {
+        let mut controls = [SubpictureStreamControl {
+            available: false,
+            stream_4x3: 0,
+            stream_wide: 0,
+            stream_letterbox: 0,
+            stream_pan_scan: 0,
+        }; 32];
+        controls[0] = SubpictureStreamControl {
+            available: true,
+            stream_4x3: 1,
+            stream_wide: 1,
+            stream_letterbox: 2,
+            stream_pan_scan: 2,
+        };
+        let mut out = Vec::new();
+
+        assert!(declared_from_controls(&[], &controls, &[], &mut out));
+        assert_eq!(out, vec![Track::Subpicture(1), Track::Subpicture(2)]);
+    }
+
+    /// A coding mode this remuxer cannot name must make the IFO unusable as a
+    /// standard, rather than put a guessed codec on a track.
+    #[test]
+    fn an_unnamable_coding_mode_makes_the_declaration_unusable() {
+        let controls = [AudioStreamControl {
+            available: true,
+            stream_number: 1,
+        }; 8];
+        // Byte 0 bits 7..5 = 1 is MPEG-1 audio, which this remuxer drops.
+        let attributes = [attribute(0), attribute(1)];
+        let mut out = Vec::new();
+
+        assert!(!declared_from_controls(
+            &controls,
+            &[],
+            &attributes,
+            &mut out
+        ));
+    }
+
+    /// The probe may only stop on a set that is both complete against the IFO
+    /// and still trusted: either half alone stops early on a disc that deserves
+    /// a full read.
+    #[test]
+    fn the_probe_stops_only_on_a_confirmed_and_trustworthy_stream_set() {
+        let declared = [Track::Video, Track::Ac3(0)];
+        let seen = [Track::Ac3(0), Track::Video];
+
+        assert!(probe_confirmed(true, &declared, &seen));
+        // A declared stream is still missing, so keep reading.
+        assert!(!probe_confirmed(true, &declared, &[Track::Video]));
+        // The title carried an undeclared stream, so the IFO cannot be trusted
+        // to say when the set is complete.
+        assert!(!probe_confirmed(false, &declared, &seen));
+    }
+
+    /// Stopping is not cancelling: the walk ends where it is told to and leaves
+    /// a usable result, which is what lets the probe stop short and still mux.
+    #[test]
+    fn a_stop_flag_ends_the_walk_without_an_error() {
+        let stop = AtomicBool::new(false);
+        let mut reader = RequestCounter::new(100);
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut walked = 0u64;
+        let mut sectors = |n: u64| {
+            walked += n;
+            if walked == 5 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            99,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            WalkFlags {
+                stop: Some(&stop),
+                cancel: None,
+            },
+        )
+        .expect("a stopped walk is not an error");
+
+        assert_eq!(walked, 5, "the walk ends where it was told to");
+    }
+
+    /// A drive answering "not ready" is a delay, not damage: it must be waited
+    /// out rather than recorded as an unreadable sector. This is the answer a
+    /// drive gives while it spins up.
+    #[test]
+    fn a_not_ready_drive_is_waited_out_rather_than_written_off() {
+        /// Fills any request with navigation packs, after answering
+        /// `WouldBlock` a fixed number of times.
+        struct NotReady {
+            pos: u64,
+            remaining: u32,
+        }
+
+        impl std::io::Read for NotReady {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining > 0 {
+                    self.remaining -= 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "drive not ready",
+                    ));
+                }
+                let pack = nav_pack();
+                for chunk in buf.chunks_mut(SECTOR) {
+                    chunk.copy_from_slice(&pack[..chunk.len()]);
+                }
+                self.pos += buf.len() as u64;
+                Ok(buf.len())
+            }
+        }
+
+        impl std::io::Seek for NotReady {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.pos = match pos {
+                    SeekFrom::Start(p) => p,
+                    SeekFrom::Current(delta) => (self.pos as i64 + delta).max(0) as u64,
+                    SeekFrom::End(_) => 0,
+                };
+                Ok(self.pos)
+            }
+        }
+
+        let mut reader = NotReady {
+            pos: 0,
+            remaining: 2,
+        };
+        let mut pes = |_pes: PesPacket<'_>| -> Result<(), DiscError> { Ok(()) };
+        let mut walked = 0u64;
+        let mut sectors = |n: u64| walked += n;
+        let mut unreadable = 0u64;
+
+        walk_sectors(
+            &mut reader,
+            0,
+            1,
+            &mut pes,
+            &mut sectors,
+            &mut unreadable,
+            WalkFlags::default(),
+        )
+        .expect("walk");
+
+        assert_eq!(walked, 2);
+        assert_eq!(unreadable, 0, "a not-ready drive is not damaged media");
     }
 }

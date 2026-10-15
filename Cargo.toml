@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/packrat-core", "crates/packrat-cli"]
+members = ["crates/packrat-core", "crates/packrat-engine", "crates/packrat-gui"]
 
 [workspace.package]
 version = "0.1.0-rc.4"
@@ -12,6 +12,8 @@ repository = "https://github.com/rodent-software/packrat"
 homepage = "https://rodent-software.github.io/packrat/"
 
 [workspace.dependencies]
+packrat-core = { path = "crates/packrat-core" }
+packrat-engine = { path = "crates/packrat-engine" }
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }

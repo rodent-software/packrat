@@ -18,6 +18,18 @@ use crate::error::DiscError;
 /// `dvdcss_read` flag: decrypt the sectors we read.
 const DVDCSS_READ_DECRYPT: c_int = 1 << 0;
 
+/// `dvdcss_seek` flag: this is `.VOB` data, so check the title key.
+///
+/// libdvdcss's own documentation gives this flag for reading `.VOB` files, and
+/// it is not merely a hint: `dvdcss_title()` — the only thing that ever sets
+/// libdvdcss's per-title key — is called from `dvdcss_seek` and nowhere else.
+/// Passing zero therefore leaves that key as whatever `malloc` returned (the
+/// library only ever zeroes the *disc* key), after which `dvdcss_read` sees a
+/// key that is not zero, believes it has one, and descrambles with it. Every
+/// CSS-scrambled sector comes back as noise while the unscrambled ones are
+/// perfect — a rip that looks healthy and plays with whole pictures missing.
+const DVDCSS_SEEK_MPEG: c_int = 1 << 0;
+
 /// Library file names to try, most specific first.
 #[cfg(target_os = "windows")]
 const LIBRARY_NAMES: &[&str] = &["libdvdcss-2.dll", "libdvdcss.dll", "dvdcss.dll"];
@@ -225,17 +237,22 @@ impl Dvdcss {
 
     /// Read `buf.len() / 2048` consecutive, decrypted sectors from `lba`.
     ///
-    /// One `dvdcss_read` covers the whole span. Each call becomes a single
-    /// request on the drive, and a drive answers a command in roughly a
-    /// millisecond whatever its size, so asking for one 2 KiB sector at a time
-    /// runs the rip at the drive's command rate — about 2 MB/s — instead of at
-    /// its media rate.
+    /// One `dvdcss_read` covers the whole span. A drive answers a command in
+    /// roughly a millisecond whatever its size, so asking for one 2 KiB sector
+    /// at a time runs a rip at the drive's command rate — about 2 MB/s —
+    /// instead of at its media rate. A span is no less correct than a sector at
+    /// a time: libdvdcss descrambles each block in it with the key read from
+    /// that block's own bytes.
+    ///
+    /// (This was briefly read one sector at a time while the pictures going
+    /// missing were being tracked down. That turned out to be a missing title
+    /// key — see [`DVDCSS_SEEK_MPEG`] — and not the span read, which had been
+    /// returning byte-identical data to the per-sector path all along.)
     ///
     /// `buf` must hold a whole number of sectors.
     pub fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), DiscError> {
         debug_assert!(!buf.is_empty() && buf.len() % 2048 == 0);
-        let blocks = buf.len() / 2048;
-        let blocks = c_int::try_from(blocks)
+        let blocks = c_int::try_from(buf.len() / 2048)
             .map_err(|_| DiscError::Remux("read window out of range".into()))?;
 
         self.seek_blocks(lba)?;
@@ -256,7 +273,11 @@ impl Dvdcss {
         Ok(())
     }
 
-    /// Position the handle at absolute disc LBA `lba`.
+    /// Position the handle at absolute disc LBA `lba`, asking for nothing else.
+    ///
+    /// Cheap, and the one the reads use. The title key is settled separately by
+    /// [`Self::check_title_key`], because libdvdcss charges dearly for asking
+    /// about it more than once.
     fn seek_blocks(&mut self, lba: u64) -> Result<(), DiscError> {
         let blocks =
             c_int::try_from(lba).map_err(|_| DiscError::Remux("LBA out of range".into()))?;
@@ -264,6 +285,29 @@ impl Dvdcss {
         if seeked < 0 {
             let source = std::io::Error::last_os_error();
             return Err(self.failure(source, format!("dvdcss_seek({lba})")));
+        }
+        Ok(())
+    }
+
+    /// Settle the title key for the title set `lba` falls in, once.
+    ///
+    /// This is the seek with `DVDCSS_SEEK_MPEG`, which is the only thing that
+    /// ever makes libdvdcss crack and install a per-title key. It has to be
+    /// done **once per title set and no more**: libdvdcss reuses a key it has
+    /// cached only when the seek lands *exactly* on the block it cached it
+    /// under, so a flagged seek to any other block re-runs the whole
+    /// title-key crack — and writes a cache file in `~/.dvdcss` for that block
+    /// while it is at it. Asking on every read turned a 6 MB/s rip into 2.3 MB/s
+    /// and littered the cache with an entry per seek.
+    ///
+    /// The key stays in force for the reads that follow, whatever they seek to.
+    pub fn check_title_key(&mut self, lba: u64) -> Result<(), DiscError> {
+        let blocks =
+            c_int::try_from(lba).map_err(|_| DiscError::Remux("LBA out of range".into()))?;
+        let seeked = unsafe { (self.api.seek)(self.handle, blocks, DVDCSS_SEEK_MPEG) };
+        if seeked < 0 {
+            let source = std::io::Error::last_os_error();
+            return Err(self.failure(source, format!("dvdcss_seek({lba}, title key)")));
         }
         Ok(())
     }
@@ -309,6 +353,7 @@ impl Drop for Dvdcss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// A candidate that cannot exist must yield a readable reason rather than
     /// panicking, so a missing library degrades cleanly.
@@ -328,5 +373,113 @@ mod tests {
     fn status_is_queryable() {
         let status = status();
         let _ = status.is_available();
+    }
+
+    /// What the stub library was asked for, as `(lba, blocks)` per read.
+    static CALLS: Mutex<Vec<(u64, c_int)>> = Mutex::new(Vec::new());
+    /// The flags each seek was given.
+    static SEEKS: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn stub_open(_path: *const c_char) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn stub_close(_handle: *mut c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn stub_seek(_handle: *mut c_void, blocks: c_int, flags: c_int) -> c_int {
+        SEEKS.lock().unwrap_or_else(|e| e.into_inner()).push(flags);
+        // A seek returns the new position, which is the block it was given.
+        blocks
+    }
+    unsafe extern "C" fn stub_read(
+        _handle: *mut c_void,
+        _buf: *mut c_void,
+        blocks: c_int,
+        _flags: c_int,
+    ) -> c_int {
+        // The stub cannot see the requested lba, so it is recorded by the seek
+        // that preceded it; this records how much was asked for in one call.
+        let lba = CALLS.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+        CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((lba, blocks));
+        blocks
+    }
+    unsafe extern "C" fn stub_error(_handle: *mut c_void) -> *const c_char {
+        c"stub".as_ptr()
+    }
+
+    /// A span read must go to libdvdcss as one call covering the span.
+    ///
+    /// Pinned because it is the difference between a rip running at the drive's
+    /// command rate (about 2 MB/s) and at its media rate. It was briefly
+    /// un-pinned while the pictures going missing were being chased, and the
+    /// span read turned out to be innocent — the cause was the missing title
+    /// key — so it is back and pinned again.
+    #[test]
+    fn a_span_read_goes_to_libdvdcss_in_one_call() {
+        CALLS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let api: &'static DvdcssApi = Box::leak(Box::new(DvdcssApi {
+            open: stub_open,
+            close: stub_close,
+            seek: stub_seek,
+            read: stub_read,
+            error: stub_error,
+            path: PathBuf::from("stub"),
+        }));
+        let mut css = Dvdcss {
+            api,
+            handle: std::ptr::null_mut(),
+        };
+
+        let mut span = [0u8; 2048 * 5];
+        css.read_blocks(100, &mut span).expect("the stub reads");
+
+        let calls = CALLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(calls.len(), 1, "one call for the whole span: {calls:?}");
+        assert_eq!(calls[0].1, 5, "and it asks for all five blocks");
+    }
+
+    /// The seek must ask libdvdcss for the title key.
+    ///
+    /// The title key must be asked for, and asked for exactly once per set.
+    ///
+    /// With no flag libdvdcss never sets that key: it only ever zeroes the
+    /// *disc* key, so the title key is whatever `malloc` returned, and every
+    /// scrambled sector is descrambled with it — silent, and a file that plays
+    /// with whole pictures missing. With the flag on *every* seek, though,
+    /// libdvdcss re-cracks it for each new block (it only reuses a key cached
+    /// under the exact block it was asked about), which costs the rip two
+    /// thirds of its speed and fills `~/.dvdcss` with an entry per seek. Hence
+    /// both halves are pinned here.
+    #[test]
+    fn the_title_key_is_asked_for_once_and_reads_do_not_re_ask() {
+        SEEKS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let api: &'static DvdcssApi = Box::leak(Box::new(DvdcssApi {
+            open: stub_open,
+            close: stub_close,
+            seek: stub_seek,
+            read: stub_read,
+            error: stub_error,
+            path: PathBuf::from("stub"),
+        }));
+        let mut css = Dvdcss {
+            api,
+            handle: std::ptr::null_mut(),
+        };
+
+        css.check_title_key(1234).expect("the stub seeks");
+        let mut span = [0u8; 2048];
+        css.read_blocks(1234, &mut span).expect("the stub reads");
+        css.read_blocks(1400, &mut span).expect("the stub reads");
+
+        let flags = SEEKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            flags,
+            vec![DVDCSS_SEEK_MPEG, 0, 0],
+            "the key is asked for once, and the reads ask for nothing"
+        );
+        assert_ne!(DVDCSS_SEEK_MPEG, 0, "and it must not be the no-flags value");
     }
 }

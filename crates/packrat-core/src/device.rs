@@ -56,8 +56,14 @@ impl DeviceChainReader {
     /// carry absolute disc LBAs already.
     pub fn open(device: &Path, vts_number: u8) -> Result<Self, DiscError> {
         let base_lba = vts_chain_base_lba(device, vts_number)?;
+        let mut backend = Backend::open(device)?;
+        // One title set, one title key: settle it here, at the set's own start,
+        // so that the reads below never have to ask libdvdcss about it again.
+        // A failure here is a failure to read the disc correctly, not something
+        // to plough on through.
+        backend.check_title_key(base_lba)?;
         Ok(Self {
-            backend: Backend::open(device)?,
+            backend,
             base_lba,
             pos: 0,
             cache: Box::new([0u8; SECTOR]),
@@ -133,6 +139,18 @@ impl Backend {
 
     fn read_sector(&mut self, lba: u64, buf: &mut [u8; SECTOR]) -> io::Result<()> {
         self.read_range(lba, buf)
+    }
+
+    /// Settle the CSS title key for the title set starting at `base_lba`.
+    ///
+    /// Only the decrypted backend has a key to settle; a plain device hands
+    /// back the disc's bytes as they are, and the recording backend is a test
+    /// double.
+    fn check_title_key(&mut self, base_lba: u64) -> Result<(), DiscError> {
+        match self {
+            Backend::Dvdcss(css) => css.check_title_key(base_lba),
+            _ => Ok(()),
+        }
     }
 
     /// Read whole sectors in a single request.

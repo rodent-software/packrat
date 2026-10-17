@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::media::{
+    avc_config_record, MatroskaMuxer, Packet, PacketFlags, StreamInfo, TimeBase, TsDemuxer,
+    WriteSeek,
+};
 use oxideav_bluray::bdmv::mpls::PlayListMpls;
 use oxideav_bluray::{Disc, TitleInfo, TitleKind, TitleSource, TrackKind, VideoFormat};
-use oxideav_core::{Muxer, NullCodecResolver, StreamInfo, WriteSeek};
-use oxideav_mkv::mux::MkvMuxer;
-use oxideav_mpegts::demuxer;
 
 use crate::disc::{DiscModel, Title};
 use crate::error::DiscError;
@@ -223,7 +224,7 @@ pub fn remux_title(
         read_bytes: Arc::clone(&read_bytes),
     };
 
-    let mut demux = demuxer::open(Box::new(reader), &NullCodecResolver)
+    let mut demux = TsDemuxer::open(Box::new(reader))
         .map_err(|error| DiscError::Remux(format!("Blu-ray MPEG-TS demux: {error}")))?;
     let mut streams = demux.streams().to_vec();
     let video = streams.iter().position(|stream| {
@@ -258,12 +259,12 @@ pub fn remux_title(
     let mut have_avcc = video.is_none();
     while pending.len() < 4000 && !have_avcc {
         match demux.next_packet() {
-            Ok(packet) => {
+            Ok(Some(packet)) => {
                 if Some(packet.stream_index) == video.map(|index| index as u32) {
                     if contains_nal_type(&packet.data, 7) {
-                        let repack = oxideav_mkv::avc::annexb_to_avcc(&packet.data);
-                        if !repack.config_record.is_empty() {
-                            parameter_sets = Some(repack.config_record);
+                        let config = avc_config_record(&packet.data);
+                        if !config.is_empty() {
+                            parameter_sets = Some(config);
                         }
                     }
                     if packet.pts.is_some_and(|pts| pts >= title_start as i64)
@@ -277,7 +278,7 @@ pub fn remux_title(
                 }
                 pending.push(packet);
             }
-            Err(oxideav_core::Error::Eof) => break,
+            Ok(None) => break,
             Err(error) => {
                 return Err(DiscError::Remux(format!(
                     "reading Blu-ray parameter sets: {error}"
@@ -308,7 +309,7 @@ pub fn remux_title(
         source,
     })?;
     let writer: Box<dyn WriteSeek> = Box::new(BufWriter::new(output));
-    let mut muxer = MkvMuxer::new_matroska(writer, &streams)
+    let mut muxer = MatroskaMuxer::new(writer, &streams)
         .map_err(|error| DiscError::Remux(format!("MKV mux init: {error}")))?;
     muxer
         .with_duration_finalization()
@@ -354,14 +355,14 @@ pub fn remux_title(
                 return Err(DiscError::Cancelled);
             }
             match demux.next_packet() {
-                Ok(packet) => {
+                Ok(Some(packet)) => {
                     if Some(packet.stream_index) == video.map(|index| index as u32) {
                         video_assembler.feed(&mut writer, packet)?;
                     } else {
                         audio_assembler.feed(&mut writer, packet)?;
                     }
                 }
-                Err(oxideav_core::Error::Eof) => break,
+                Ok(None) => break,
                 Err(error) => {
                     return Err(DiscError::Remux(format!("reading Blu-ray title: {error}")))
                 }
@@ -485,7 +486,7 @@ impl Seek for TitleReader {
 }
 
 struct MuxWriter<'a> {
-    muxer: &'a mut MkvMuxer,
+    muxer: &'a mut MatroskaMuxer,
     base_pts: Option<i64>,
     report: &'a mut RemuxReport,
     progress: &'a mut dyn FnMut(RemuxProgress),
@@ -494,7 +495,7 @@ struct MuxWriter<'a> {
 }
 
 impl MuxWriter<'_> {
-    fn write(&mut self, mut packet: oxideav_core::Packet) -> Result<(), DiscError> {
+    fn write(&mut self, mut packet: Packet) -> Result<(), DiscError> {
         if let Some(base) = self.base_pts {
             if let Some(pts) = &mut packet.pts {
                 *pts = (*pts - base).max(0);
@@ -547,11 +548,7 @@ impl AuAssembler {
         }
     }
 
-    fn feed(
-        &mut self,
-        writer: &mut MuxWriter<'_>,
-        packet: oxideav_core::Packet,
-    ) -> Result<(), DiscError> {
+    fn feed(&mut self, writer: &mut MuxWriter<'_>, packet: Packet) -> Result<(), DiscError> {
         self.carry.extend_from_slice(&packet.data);
         let starts = start_codes(&self.carry);
         if starts.len() < 2 {
@@ -608,13 +605,13 @@ impl AuAssembler {
         }
         if !data.is_empty() {
             let keyframe = contains_nal_type(&self.au, 5);
-            writer.write(oxideav_core::Packet {
+            writer.write(Packet {
                 stream_index: self.video.unwrap_or(0),
-                time_base: oxideav_core::TimeBase::new(1, 90_000),
+                time_base: TimeBase::new(1, 90_000),
                 pts: self.pts,
                 dts: self.dts,
                 duration: None,
-                flags: oxideav_core::packet::PacketFlags {
+                flags: PacketFlags {
                     keyframe,
                     ..Default::default()
                 },
@@ -665,11 +662,7 @@ impl AudioAssembler {
         }
     }
 
-    fn feed(
-        &mut self,
-        writer: &mut MuxWriter<'_>,
-        packet: oxideav_core::Packet,
-    ) -> Result<(), DiscError> {
+    fn feed(&mut self, writer: &mut MuxWriter<'_>, packet: Packet) -> Result<(), DiscError> {
         if Some(packet.stream_index) == self.dts {
             // A DTS-HD MA access unit is a core frame followed by one or
             // more extension frames. Keep the core and its extensions in
@@ -736,13 +729,13 @@ impl AudioAssembler {
                 return Ok(());
             }
             let frame: Vec<u8> = self.truehd_carry.drain(..size).collect();
-            writer.write(oxideav_core::Packet {
+            writer.write(Packet {
                 stream_index: self.truehd.unwrap_or(0),
-                time_base: oxideav_core::TimeBase::new(1, 90_000),
+                time_base: TimeBase::new(1, 90_000),
                 pts: self.truehd_pts,
                 dts: self.truehd_dts,
                 duration: None,
-                flags: oxideav_core::packet::PacketFlags::default(),
+                flags: PacketFlags::default(),
                 data: frame,
             })?;
             // TrueHD carries 40 samples per frame at 48 kHz: 75 ticks.
@@ -762,13 +755,13 @@ impl AudioAssembler {
         if data.is_empty() {
             return Ok(());
         }
-        writer.write(oxideav_core::Packet {
+        writer.write(Packet {
             stream_index: self.dts.unwrap_or(0),
-            time_base: oxideav_core::TimeBase::new(1, 90_000),
+            time_base: TimeBase::new(1, 90_000),
             pts,
             dts: None,
             duration: None,
-            flags: oxideav_core::packet::PacketFlags::default(),
+            flags: PacketFlags::default(),
             data,
         })
     }

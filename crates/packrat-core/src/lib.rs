@@ -13,6 +13,7 @@ pub mod dvdcss;
 pub mod error;
 pub mod identify;
 pub mod library;
+mod media;
 pub mod meta;
 pub mod movie;
 pub mod remux;
@@ -26,7 +27,7 @@ pub use detect::{
     primary_feature, split_title, AlternateSet, ChapterPattern, Classification, DiscKind, Segment,
     EPISODE_MAX, EPISODE_MIN, EXTRA_MIN, MIN_CONTENT, MOVIE_MIN,
 };
-pub use disc::{read_disc, read_vts, DiscModel, Title};
+pub use disc::{read_disc, read_vts, DiscModel, DvdPgc, DvdTitleSet, Title};
 pub use drives::OpticalDrive;
 pub use error::DiscError;
 pub use identify::{parse_label, LabelInfo};
@@ -44,7 +45,6 @@ pub use movie::{
     rank as rank_movies, resolve as resolve_movie, MovieQuery, MovieResolution, AUTO_ACCEPT,
     CANDIDATES as MOVIE_CANDIDATES,
 };
-pub use oxideav_dvd::VtsIfo;
 pub use remux::{
     remux_chain, remux_chain_with_progress, remux_chain_with_progress_and_cancel, remux_chapters,
     remux_chapters_with_reader, remux_title, RemuxPhase, RemuxProgress, RemuxReport,

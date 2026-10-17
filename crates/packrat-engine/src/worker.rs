@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use packrat_core::{
     read_vts, remux_chain_with_progress_and_cancel, Classification, DiscError, DiscModel,
-    DiscSource, LabelInfo, LibraryStats, Movie, OpticalDrive, RemuxPhase, RemuxProgress,
-    RemuxReport, Show, VtsIfo,
+    DiscSource, DvdTitleSet, LabelInfo, LibraryStats, Movie, OpticalDrive, RemuxPhase,
+    RemuxProgress, RemuxReport, Show,
 };
 
 use crate::disc::{load_device, load_disc};
@@ -342,7 +342,7 @@ pub fn spawn_rip(
         // re-reading it walks the whole disc filesystem each time, and nothing
         // in that path checks the stop flag — so it is both slow and
         // uninterruptible. Read each title set once.
-        let mut vts_cache: HashMap<u8, VtsIfo> = HashMap::new();
+        let mut vts_cache: HashMap<u8, DvdTitleSet> = HashMap::new();
 
         for job in jobs {
             // `cancel` stops between files; `abort` also stops the file that

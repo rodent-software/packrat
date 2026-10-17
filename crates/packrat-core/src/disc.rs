@@ -13,6 +13,54 @@ use std::time::{Duration, Instant};
 use oxideav_dvd::udf::UdfVolume;
 use oxideav_dvd::{DvdDisc, DvdFile, DvdFileKind, TtSrpt, VmgIfo, VtsIfo};
 
+/// One parsed DVD video title set.
+///
+/// The IFO parser is still supplied by `oxideav-dvd`, but its types stay
+/// private to this crate. Keeping the facade here means replacing the parser
+/// later does not change `packrat-core`'s public API or the engine.
+#[derive(Debug, Clone)]
+pub struct DvdTitleSet {
+    number: u8,
+    ifo: VtsIfo,
+}
+
+/// A PGC's cell layout, with the sectors each cell plays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DvdPgc {
+    /// `(first_vobu_start_sector, last_vobu_end_sector)` per cell.
+    pub cells: Vec<(u32, u32)>,
+}
+
+impl DvdTitleSet {
+    fn new(number: u8, ifo: VtsIfo) -> Self {
+        Self { number, ifo }
+    }
+
+    /// 1-based video title set number (`VTS_xx_0`).
+    pub fn number(&self) -> u8 {
+        self.number
+    }
+
+    /// The PGCs in this title set, with their cell sector ranges.
+    pub fn pgcs(&self) -> Vec<DvdPgc> {
+        self.ifo
+            .pgcs
+            .iter()
+            .map(|pgc| DvdPgc {
+                cells: pgc
+                    .cells
+                    .iter()
+                    .map(|cell| (cell.first_vobu_start_sector, cell.last_vobu_end_sector))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn ifo(&self) -> &VtsIfo {
+        &self.ifo
+    }
+}
+
 use crate::error::DiscError;
 use crate::source::DiscSource;
 
@@ -505,17 +553,19 @@ fn read_file(path: &PathBuf) -> Result<Vec<u8>, DiscError> {
 
 /// Parse one title set's `VTS_xx_0.IFO` (needed for its PGC/cell layout when
 /// remuxing).
-pub fn read_vts(source: &DiscSource, vts_number: u8) -> Result<VtsIfo, DiscError> {
+pub fn read_vts(source: &DiscSource, vts_number: u8) -> Result<DvdTitleSet, DiscError> {
     if matches!(source, DiscSource::BluRay { .. }) {
         return Err(DiscError::BluRay(
             "Blu-ray titles do not have DVD title sets".into(),
         ));
     }
     let buf = read_vts_bytes(source, vts_number)?;
-    VtsIfo::parse(&buf, vts_number).map_err(|e| DiscError::Ifo {
-        path: vts_label(source, vts_number),
-        message: e.to_string(),
-    })
+    VtsIfo::parse(&buf, vts_number)
+        .map(|ifo| DvdTitleSet::new(vts_number, ifo))
+        .map_err(|e| DiscError::Ifo {
+            path: vts_label(source, vts_number),
+            message: e.to_string(),
+        })
 }
 
 /// The bytes of one `VTS_xx_0.IFO`, from the mount when there is one and the

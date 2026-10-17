@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use oxideav_core::packet::PacketFlags;
-use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek};
+use crate::media::{
+    CodecId, CodecParameters, MatroskaMuxer, Packet, PacketFlags, StreamInfo, TimeBase, WriteSeek,
+};
 use oxideav_dvd::vob::{
     looks_like_nav_pack, DvdSubstream, NavPack, PackHeader, PesPacket, AUDIO_SUBSTREAM_HEADER_LEN,
     SC_PADDING_STREAM, SC_PRIVATE_STREAM_1, SC_PRIVATE_STREAM_2, SC_SYSTEM_HEADER,
@@ -23,9 +24,8 @@ use oxideav_dvd::{
     AudioSubstreamHeader, DtsHeader, DvdChapter, DvdTitle, PictureCodingExtension, PictureHeader,
     PictureStructure, SequenceHeader, SubpictureStreamControl, VtsIfo,
 };
-use oxideav_mkv::mux::{MkvMuxer, MkvVideoGeometry};
 
-use crate::disc::Title;
+use crate::disc::{DvdTitleSet, Title};
 use crate::error::DiscError;
 use crate::source::DiscSource;
 
@@ -146,7 +146,7 @@ pub struct RemuxProgress {
 /// Remux a whole title to `out`.
 pub fn remux_title(
     source: &DiscSource,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     out: &Path,
 ) -> Result<RemuxReport, DiscError> {
@@ -157,7 +157,7 @@ pub fn remux_title(
 /// title's VOBs from a mounted folder.
 pub fn remux_chapters(
     source: &DiscSource,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
@@ -174,7 +174,7 @@ pub fn remux_chapters(
 /// the raw device (decrypted through the user-supplied libdvdcss when present).
 pub fn remux_chain(
     source: &DiscSource,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
@@ -186,14 +186,14 @@ pub fn remux_chain(
 /// Like [`remux_chain`], but reports [`RemuxProgress`] as it runs.
 pub fn remux_chain_with_progress(
     source: &DiscSource,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
     out: &Path,
     progress: &mut dyn FnMut(RemuxProgress),
 ) -> Result<RemuxReport, DiscError> {
-    remux_chain_impl(source, vts, title, first, last, out, progress, None)
+    remux_chain_impl(source, vts.ifo(), title, first, last, out, progress, None)
 }
 
 /// Like [`remux_chain_with_progress`], but stops as soon as `cancel` is set.
@@ -205,7 +205,7 @@ pub fn remux_chain_with_progress(
 #[allow(clippy::too_many_arguments)]
 pub fn remux_chain_with_progress_and_cancel(
     source: &DiscSource,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
@@ -213,7 +213,16 @@ pub fn remux_chain_with_progress_and_cancel(
     progress: &mut dyn FnMut(RemuxProgress),
     cancel: &AtomicBool,
 ) -> Result<RemuxReport, DiscError> {
-    remux_chain_impl(source, vts, title, first, last, out, progress, Some(cancel))
+    remux_chain_impl(
+        source,
+        vts.ifo(),
+        title,
+        first,
+        last,
+        out,
+        progress,
+        Some(cancel),
+    )
 }
 
 /// Build the right reader for the source and run the remux, passing the
@@ -336,7 +345,7 @@ impl<W: Seek> Seek for CountingWriter<W> {
 /// decrypted, re-addressed sectors.
 pub fn remux_chapters_with_reader<R: Read + Seek>(
     reader: &mut R,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
@@ -349,14 +358,23 @@ pub fn remux_chapters_with_reader<R: Read + Seek>(
 /// runs, with byte counts that span both the probe and muxing passes.
 pub fn remux_chapters_with_reader_progress<R: Read + Seek>(
     reader: &mut R,
-    vts: &VtsIfo,
+    vts: &DvdTitleSet,
     title: &Title,
     first: u16,
     last: u16,
     out: &Path,
     progress: &mut dyn FnMut(RemuxProgress),
 ) -> Result<RemuxReport, DiscError> {
-    remux_chapters_with_reader_progress_cancel(reader, vts, title, first, last, out, progress, None)
+    remux_chapters_with_reader_progress_cancel(
+        reader,
+        vts.ifo(),
+        title,
+        first,
+        last,
+        out,
+        progress,
+        None,
+    )
 }
 
 /// The cancel-aware implementation behind the public remux entry points.
@@ -621,7 +639,7 @@ fn remux_once<R: Read + Seek>(
         BufWriter::new(out_file),
         Arc::clone(&written_bytes),
     ));
-    let mut muxer = MkvMuxer::new_matroska(writer, &stream_infos)
+    let mut muxer = MatroskaMuxer::new(writer, &stream_infos)
         .map_err(|e| DiscError::Remux(format!("mux init: {e}")))?;
     muxer
         .with_duration_finalization()
@@ -630,7 +648,7 @@ fn remux_once<R: Read + Seek>(
     // 4:3 title does not play back stretched as 3:2.
     if let (Some(index), Some((num, den))) = (video_index, video_dar) {
         muxer
-            .set_video_geometry(index, MkvVideoGeometry::aspect_ratio(num, den))
+            .set_video_aspect_ratio(index, num, den)
             .map_err(|e| DiscError::Remux(format!("set video aspect ratio: {e}")))?;
     }
 
@@ -1348,7 +1366,7 @@ impl AudioFrameAssembler {
 /// Write every buffered [`Unit`] to the muxer, rebasing timestamps against the
 /// first value seen per stream.
 fn write_units(
-    muxer: &mut MkvMuxer,
+    muxer: &mut MatroskaMuxer,
     stream_index: u32,
     units: &mut Vec<Unit>,
     anchor_pts: &mut Option<u64>,

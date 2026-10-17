@@ -44,6 +44,13 @@ structure parser and AACS hook come from a local fork of `oxideav-bluray` under
 `KEYDB.cfg` path. AACS keys remain user-supplied; see [Blu-ray and AACS
 keys](blu-ray.md).
 
+External media plumbing sits behind `packrat-core/src/media.rs`: the MPEG-TS
+demuxer, Matroska writer, packet types, and AVC repacker are reached through
+that module rather than imported directly by the title code. The DVD title-set
+facade in `disc.rs` (`DvdTitleSet`) keeps `oxideav-dvd`'s parser types out of
+the public API. This is the seam used to replace each backend with a
+packrat-owned implementation while the disc and remux code stays put.
+
 ## Releases
 
 Releases are driven by [`dist`](https://axodotdev.github.io/cargo-dist) from the

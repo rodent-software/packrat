@@ -53,12 +53,12 @@ fn main() {
             continue;
         };
         println!("\n== VTS_{vts:02} ==");
-        for (n, pgc) in ifo.pgcs.iter().enumerate() {
+        for (n, pgc) in ifo.pgcs().into_iter().enumerate() {
             let mut ranges: Vec<(usize, u32, u32)> = pgc
                 .cells
                 .iter()
                 .enumerate()
-                .map(|(index, c)| (index + 1, c.first_vobu_start_sector, c.last_vobu_end_sector))
+                .map(|(index, (first, last))| (index + 1, *first, *last))
                 .collect();
             ranges.sort_by_key(|(_, first, _)| *first);
             let first = ranges.first().map(|(_, f, _)| *f).unwrap_or(0);

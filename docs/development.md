@@ -10,8 +10,9 @@ cargo build
 
 The workspace is three crates:
 
-- `packrat-core` — disc I/O: optical device access, DVD-Video structure parsing,
-  CSS decryption and remuxing. It has no UI and no user preferences.
+- `packrat-core` — disc I/O: optical device access, DVD-Video and Blu-ray
+  structure parsing, CSS/AACS decryption and remuxing. It has no UI and no user
+  preferences.
 - `packrat-engine` — orchestration between core and the window: saved settings,
   TVmaze/TMDb matching, planning a disc into the list of files to write, and the
   background worker threads. It has no graphical assumptions.
@@ -34,6 +35,14 @@ PACKRAT_DVDCSS=/path/to/libdvdcss.so.2 cargo run -- doctor
 ```
 
 See [Installation](installation.md) for the details and per-platform sources.
+
+## Blu-ray
+
+Blu-ray structure and remuxing live in `packrat-core/src/bluray.rs`. The
+structure parser and AACS hook come from a local fork of `oxideav-bluray` under
+`vendor/`, which fixes the `index.bdmv` object layout and accepts an explicit
+`KEYDB.cfg` path. AACS keys remain user-supplied; see [Blu-ray and AACS
+keys](blu-ray.md).
 
 ## Releases
 

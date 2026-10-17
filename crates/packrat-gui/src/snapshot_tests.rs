@@ -47,6 +47,7 @@ fn blank(stage: Stage) -> App {
         auto_eject: false,
         config_note: None,
         css_note: None,
+        keydb_path: None,
         config_return: Stage::Detect,
         drives: Vec::new(),
         selected_drive: None,

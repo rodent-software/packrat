@@ -4,6 +4,7 @@
 //! disc, modelling its titles, deciding what the disc is, and eventually
 //! demuxing and remuxing it into a Plex-friendly MKV.
 
+pub mod bluray;
 pub mod detect;
 pub mod device;
 pub mod disc;
@@ -19,6 +20,7 @@ pub mod source;
 pub mod stats;
 pub mod tmdb;
 
+pub use bluray::{read_disc as read_bluray_disc, remux_title as remux_bluray};
 pub use detect::{
     alternates, chapter_pattern, classify, feature_titles, movie_extras, preferred_titles,
     primary_feature, split_title, AlternateSet, ChapterPattern, Classification, DiscKind, Segment,

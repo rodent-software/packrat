@@ -117,6 +117,8 @@ pub(crate) struct App {
     pub(crate) config_note: Option<String>,
     /// Why CSS-encrypted discs cannot be read, when libdvdcss is missing.
     pub(crate) css_note: Option<String>,
+    /// The KEYDB.cfg imported through settings, when one is present.
+    pub(crate) keydb_path: Option<PathBuf>,
     config_return: Stage,
 
     // Drive picker.
@@ -224,6 +226,8 @@ pub(crate) enum Message {
     MovieDirChanged(String),
     TmdbKeyChanged(String),
     AutoEjectToggled(bool),
+    ImportKeyDb,
+    KeyDbChosen(Option<PathBuf>),
     SaveAndClose,
     OpenSettings,
     CloseSettings,
@@ -293,6 +297,9 @@ impl App {
                 "CSS-encrypted discs cannot be read: {reason}. See the installation guide."
             )),
         };
+        // The imported copy lives in packrat's own settings directory; its
+        // presence is what makes it available to every later run.
+        let keydb_path = config::imported_keydb();
 
         let mut app = App {
             stage: Stage::Setup,
@@ -308,6 +315,7 @@ impl App {
             auto_eject: config.auto_eject,
             config_note: None,
             css_note,
+            keydb_path,
             config_return: Stage::Detect,
             drives: Vec::new(),
             selected_drive: None,
@@ -870,6 +878,7 @@ impl App {
             source,
             disc,
             rip_jobs,
+            self.keydb_path.clone(),
             self.device.clone(),
         ));
     }
@@ -944,6 +953,44 @@ impl App {
                 self.auto_eject = value;
                 self.config_note = None;
             }
+            Message::ImportKeyDb => {
+                // Start in the folder the current import came from, when there
+                // is one, so replacing a database lands where it was found.
+                let start = self
+                    .keydb_path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .filter(|path| path.is_dir())
+                    .map(Path::to_path_buf);
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new()
+                            .set_title("Choose a KEYDB.cfg")
+                            .add_filter("KEYDB", &["cfg"]);
+                        if let Some(dir) = start {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog
+                            .pick_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    Message::KeyDbChosen,
+                );
+            }
+            Message::KeyDbChosen(Some(path)) => match config::import_keydb(&path) {
+                Ok(destination) => {
+                    self.keydb_path = Some(destination);
+                    self.config_note = Some(format!(
+                        "Imported KEYDB from {}. It is used for later Blu-ray backups.",
+                        path.display()
+                    ));
+                }
+                Err(error) => {
+                    self.config_note = Some(format!("Could not import KEYDB: {error:#}"));
+                }
+            },
+            Message::KeyDbChosen(None) => {}
             Message::SaveAndClose => {
                 self.save_config();
                 self.stage = self.config_return;

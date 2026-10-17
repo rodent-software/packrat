@@ -112,6 +112,10 @@ impl DiscModel {
 /// file read, and some discs with unusual copy protection enumerate better
 /// through it.
 pub fn read_disc(source: &DiscSource) -> Result<DiscModel, DiscError> {
+    if let DiscSource::BluRay { root, .. } = source {
+        return crate::bluray::read_disc(root);
+    }
+
     let mounted = source
         .video_ts()
         .map(|video_ts| read_disc_from_dir(source, video_ts));
@@ -502,6 +506,11 @@ fn read_file(path: &PathBuf) -> Result<Vec<u8>, DiscError> {
 /// Parse one title set's `VTS_xx_0.IFO` (needed for its PGC/cell layout when
 /// remuxing).
 pub fn read_vts(source: &DiscSource, vts_number: u8) -> Result<VtsIfo, DiscError> {
+    if matches!(source, DiscSource::BluRay { .. }) {
+        return Err(DiscError::BluRay(
+            "Blu-ray titles do not have DVD title sets".into(),
+        ));
+    }
     let buf = read_vts_bytes(source, vts_number)?;
     VtsIfo::parse(&buf, vts_number).map_err(|e| DiscError::Ifo {
         path: vts_label(source, vts_number),

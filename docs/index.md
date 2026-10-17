@@ -5,7 +5,9 @@ A free and open source physical media backup utility.
 ![The packrat window](assets/preview.png)
 
 New here? [Installation](installation.md) covers every platform, and explains
-how to enable CSS decryption for encrypted discs.
+how to enable CSS decryption for encrypted discs. Encrypted Blu-rays need a
+user-supplied `KEYDB.cfg`; [Blu-ray and AACS keys](blu-ray.md) explains why and
+how to import it.
 
 ## Quick start
 

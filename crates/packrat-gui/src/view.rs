@@ -12,7 +12,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, Length, Theme};
 
-use packrat_core::{DiscKind, OpticalDrive, Title};
+use packrat_core::{DiscKind, DiscSource, OpticalDrive, Title};
 
 use crate::jobs::{self, Job, JobStatus};
 use crate::theme::{self, ACCENT, DANGER, MUTED, SUCCESS, TEXT, WARNING};
@@ -160,6 +160,12 @@ fn backup(app: &App) -> Element<'_, Message> {
 
     // 1. Which disc to read: one field, and the picker for it.
     body = body.push(choose_disc_card(app));
+
+    if matches!(&app.source, Some(DiscSource::BluRay { .. })) {
+        body = body.push(notice_block(
+            "Blu-ray support handles H.264 titles; HEVC, VC-1 and MPEG-2 video are not supported yet.",
+        ));
+    }
 
     if app.disc.is_some() {
         // 2. What it is and what to call it: the identity the disc was read as,
@@ -424,6 +430,9 @@ fn settings(app: &App) -> Element<'_, Message> {
     ]
     .spacing(14);
 
+    form = form.push(divider());
+    form = form.push(keydb_section(app));
+
     if let Some(note) = &app.config_note {
         form = form.push(text(note.clone()).size(CAPTION).color(MUTED));
     }
@@ -441,6 +450,42 @@ fn settings(app: &App) -> Element<'_, Message> {
         .spacing(16),
     )
     .center_x(Fill)
+    .into()
+}
+
+/// The AACS key database: import it once, use it for every later backup.
+fn keydb_section(app: &App) -> Element<'_, Message> {
+    let (status, status_color, action) = match &app.keydb_path {
+        Some(path) if path.is_file() => {
+            (format!("Using {}", path.display()), MUTED, "Replace KEYDB…")
+        }
+        Some(path) => (
+            format!("KEYDB not found at {}. Import it again.", path.display()),
+            WARNING,
+            "Replace KEYDB…",
+        ),
+        None => (
+            "No KEYDB imported. Encrypted Blu-rays cannot be read yet.".to_string(),
+            MUTED,
+            "Import KEYDB…",
+        ),
+    };
+
+    column![
+        text("Blu-ray keys").size(HEADING),
+        text(
+            "Import a KEYDB.cfg to decrypt AACS-protected Blu-rays. The file is \
+             copied into packrat's settings, so every later backup can use it."
+        )
+        .size(CAPTION)
+        .color(MUTED),
+        text(status).size(CAPTION).color(status_color).width(Fill),
+        button(text(action).size(BODY))
+            .on_press(Message::ImportKeyDb)
+            .style(theme::ghost)
+            .padding(9),
+    ]
+    .spacing(8)
     .into()
 }
 
@@ -801,7 +846,7 @@ fn table_header() -> Element<'static, Message> {
             .size(CAPTION)
             .color(MUTED)
             .width(Length::Fixed(60.0)),
-        text("VTS")
+        text("SOURCE")
             .size(CAPTION)
             .color(MUTED)
             .width(Length::Fixed(50.0)),
@@ -846,7 +891,7 @@ fn job_row<'a>(
                     .size(BODY)
                     .color(MUTED)
                     .width(Length::Fixed(60.0)),
-                text(title.vts.to_string())
+                text(source_cell(title))
                     .size(BODY)
                     .color(MUTED)
                     .width(Length::Fixed(50.0)),
@@ -887,7 +932,7 @@ fn skipped_row(title: &Title, stripe_index: usize) -> Element<'static, Message> 
                 .size(BODY)
                 .color(MUTED)
                 .width(Length::Fixed(60.0)),
-            text(title.vts.to_string())
+            text(source_cell(title))
                 .size(BODY)
                 .color(MUTED)
                 .width(Length::Fixed(50.0)),
@@ -900,6 +945,15 @@ fn skipped_row(title: &Title, stripe_index: usize) -> Element<'static, Message> 
     .padding(10)
     .width(Fill)
     .into()
+}
+
+/// The source a title comes from: a DVD title set, or a Blu-ray playlist.
+fn source_cell(title: &Title) -> String {
+    if title.vts == 0 {
+        format!("PL{:03}", title.number)
+    } else {
+        title.vts.to_string()
+    }
 }
 
 /// `chapters 3-4`, or `chapter 3` when a file is one chapter long.

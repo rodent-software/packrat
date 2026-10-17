@@ -24,6 +24,14 @@ pub enum DiscError {
     #[error("remux failed: {0}")]
     Remux(String),
 
+    /// Blu-ray structure or title could not be read.
+    #[error("Blu-ray error: {0}")]
+    BluRay(String),
+
+    /// A Blu-ray is AACS-encrypted and no usable key was found.
+    #[error("AACS decryption unavailable: {0}")]
+    AacsKey(String),
+
     /// libdvdcss is needed but could not be loaded; the string explains why
     /// and how to supply it.
     #[error("CSS decryption unavailable: {0}")]

@@ -4,6 +4,8 @@ packrat is a single executable with no native build dependencies. Backing up an
 unencrypted disc needs nothing else. Reading a **CSS-encrypted** DVD through the
 raw device additionally needs `libdvdcss`, which packrat loads at runtime from a
 copy you install — see [Enabling CSS decryption](#enabling-css-decryption).
+Reading an **AACS-encrypted Blu-ray** additionally needs a `KEYDB.cfg`, which
+you can import in settings — see [Blu-ray and AACS keys](blu-ray.md).
 
 ## Installing packrat
 

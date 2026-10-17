@@ -12,6 +12,8 @@ homepage.workspace = true
 [dependencies]
 thiserror.workspace = true
 oxideav-dvd.workspace = true
+oxideav-bluray.workspace = true
+oxideav-mpegts.workspace = true
 oxideav-mkv.workspace = true
 oxideav-core.workspace = true
 serde.workspace = true

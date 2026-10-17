@@ -330,6 +330,7 @@ pub fn spawn_rip(
     source: DiscSource,
     disc: DiscModel,
     jobs: Vec<RipJob>,
+    keydb: Option<PathBuf>,
     device: Option<PathBuf>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -374,24 +375,37 @@ pub fn spawn_rip(
                             elapsed: started.elapsed(),
                         });
                     };
-                    let vts = match vts_cache.get(&title.vts) {
-                        Some(vts) => Ok(vts.clone()),
-                        None => read_vts(&source, title.vts).inspect(|vts| {
-                            vts_cache.insert(title.vts, vts.clone());
-                        }),
-                    };
-                    vts.and_then(|vts| {
-                        remux_chain_with_progress_and_cancel(
+                    if matches!(&source, packrat_core::DiscSource::BluRay { .. }) {
+                        packrat_core::remux_bluray(
                             &source,
-                            &vts,
                             title,
                             job.first,
                             job.last,
                             &job.path,
+                            keydb.as_deref(),
                             &mut report_progress,
-                            &abort,
+                            Some(abort.as_ref()),
                         )
-                    })
+                    } else {
+                        let vts = match vts_cache.get(&title.vts) {
+                            Some(vts) => Ok(vts.clone()),
+                            None => read_vts(&source, title.vts).inspect(|vts| {
+                                vts_cache.insert(title.vts, vts.clone());
+                            }),
+                        };
+                        vts.and_then(|vts| {
+                            remux_chain_with_progress_and_cancel(
+                                &source,
+                                &vts,
+                                title,
+                                job.first,
+                                job.last,
+                                &job.path,
+                                &mut report_progress,
+                                &abort,
+                            )
+                        })
+                    }
                 }
                 None => Err(DiscError::Remux(format!("disc has no title {}", job.title))),
             };

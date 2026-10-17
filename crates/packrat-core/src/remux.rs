@@ -230,6 +230,9 @@ fn remux_chain_impl(
     cancel: Option<&AtomicBool>,
 ) -> Result<RemuxReport, DiscError> {
     match source {
+        DiscSource::BluRay { .. } => Err(DiscError::Remux(
+            "Blu-ray titles use the Blu-ray remux path".into(),
+        )),
         DiscSource::Folder { .. } => {
             let video_ts = source
                 .video_ts()
@@ -767,14 +770,14 @@ fn remux_once<R: Read + Seek>(
 }
 
 /// `out` with `.partial` appended.
-fn partial_path(out: &Path) -> PathBuf {
+pub(crate) fn partial_path(out: &Path) -> PathBuf {
     let mut os = out.as_os_str().to_owned();
     os.push(".partial");
     PathBuf::from(os)
 }
 
 /// Rename over an existing file, working around Windows' refusal to do so.
-fn replace_file(from: &Path, to: &Path) -> Result<(), DiscError> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> Result<(), DiscError> {
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(source) => {
@@ -798,17 +801,17 @@ fn replace_file(from: &Path, to: &Path) -> Result<(), DiscError> {
 }
 
 /// Deletes a half-written file unless defused.
-struct PartialFile {
+pub(crate) struct PartialFile {
     path: PathBuf,
     armed: bool,
 }
 
 impl PartialFile {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
 
-    fn defuse(&mut self) {
+    pub(crate) fn defuse(&mut self) {
         self.armed = false;
     }
 }

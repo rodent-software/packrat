@@ -50,6 +50,23 @@ fn discover_accepts_video_ts_dir() {
 }
 
 #[test]
+fn discover_accepts_bluray_root_and_bdmv_dir() {
+    let root = unique_dir("bdmv");
+    fs::create_dir_all(root.join("BDMV/PLAYLIST")).unwrap();
+
+    let source = DiscSource::discover(&root).expect("Blu-ray root should be accepted");
+    assert!(matches!(source, DiscSource::BluRay { .. }));
+    assert_eq!(source.root(), root);
+    assert!(source.video_ts().is_none());
+
+    let from_bdmv = DiscSource::discover(root.join("BDMV")).expect("BDMV dir should be accepted");
+    assert!(matches!(from_bdmv, DiscSource::BluRay { .. }));
+    assert_eq!(from_bdmv.root(), root);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn discover_rejects_paths_without_video_ts() {
     let err = DiscSource::discover("/definitely/not/a/real/disc/path").unwrap_err();
     assert!(matches!(err, DiscError::NoVideoTs(_)));

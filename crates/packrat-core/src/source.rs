@@ -1,20 +1,26 @@
 //! Where the bytes of a disc come from.
 //!
-//! Two shapes are supported: a mounted DVD-Video folder (or an extracted copy
-//! of one), and a raw optical device. The device form is what CSS decryption
-//! needs, and it is also what lets packrat read a disc the desktop never
-//! mounted: the ISO 9660/UDF directory is not encrypted, so the `IFO` files
-//! can be found straight off the device.
+//! Three shapes are supported: a mounted DVD-Video folder (or an extracted copy
+//! of one), a mounted Blu-ray disc, and a raw optical device. The device form is
+//! what CSS decryption needs, and it is also what lets packrat read a disc the
+//! desktop never mounted: the ISO 9660/UDF directory is not encrypted, so the
+//! `IFO` files can be found straight off the device.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::DiscError;
 
-/// A location whose `VIDEO_TS` contents can be read.
+/// A location whose video contents can be read.
 #[derive(Debug, Clone)]
 pub enum DiscSource {
     /// A mounted DVD-Video disc or an extracted folder containing `VIDEO_TS/`.
     Folder { root: PathBuf, video_ts: PathBuf },
+    /// A mounted Blu-ray disc (or an extracted copy) containing `BDMV/`.
+    BluRay {
+        root: PathBuf,
+        /// The optical device, when this source came from a drive.
+        device: Option<PathBuf>,
+    },
     /// A raw optical device (`/dev/sr0`), plus a mount of the same disc when
     /// the desktop made one. The mount supplies the `IFO` files when it is
     /// there; without it they are read from the device's own filesystem.
@@ -27,12 +33,16 @@ pub enum DiscSource {
 impl DiscSource {
     /// Discover a folder-backed source from a path.
     ///
-    /// Accepts either a disc root that contains `VIDEO_TS/`, or the `VIDEO_TS`
-    /// directory itself.
+    /// Accepts a disc root (or the `BDMV` / `VIDEO_TS` directory itself) for
+    /// either media kind.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, DiscError> {
         let path = path.as_ref();
 
         if path.is_dir() {
+            if let Some(root) = bluray_root(path) {
+                return Ok(Self::BluRay { root, device: None });
+            }
+
             let looks_like_video_ts = path
                 .file_name()
                 .map(|n| n.eq_ignore_ascii_case("VIDEO_TS"))
@@ -60,13 +70,20 @@ impl DiscSource {
 
     /// Build a device-backed source.
     ///
-    /// `mount` is the disc's mount point when the desktop mounted it. It is not
-    /// required: without a mount the device's own filesystem is read instead,
-    /// which is the common case on a machine with no automounter.
+    /// `mount` is the disc's mount point when the desktop mounted it. A Blu-ray
+    /// is usable only through that mount for now; without one the disc's own
+    /// filesystem would have to be mounted from the raw device.
     pub fn discover_device(
         device: impl AsRef<Path>,
         mount: Option<&Path>,
     ) -> Result<Self, DiscError> {
+        if let Some(root) = mount.and_then(bluray_root) {
+            return Ok(Self::BluRay {
+                root,
+                device: Some(device.as_ref().to_path_buf()),
+            });
+        }
+
         let video_ts = mount.and_then(|mount| {
             let candidate = if mount
                 .file_name()
@@ -89,7 +106,7 @@ impl DiscSource {
     /// The disc's root directory: the mount when there is one, else the device.
     pub fn root(&self) -> &Path {
         match self {
-            Self::Folder { root, .. } => root,
+            Self::Folder { root, .. } | Self::BluRay { root, .. } => root,
             Self::Device { device, video_ts } => {
                 video_ts.as_deref().and_then(Path::parent).unwrap_or(device)
             }
@@ -100,6 +117,7 @@ impl DiscSource {
     pub fn video_ts(&self) -> Option<&Path> {
         match self {
             Self::Folder { video_ts, .. } => Some(video_ts),
+            Self::BluRay { .. } => None,
             Self::Device { video_ts, .. } => video_ts.as_deref(),
         }
     }
@@ -108,6 +126,7 @@ impl DiscSource {
     pub fn device(&self) -> Option<&Path> {
         match self {
             Self::Folder { .. } => None,
+            Self::BluRay { device, .. } => device.as_deref(),
             Self::Device { device, .. } => Some(device),
         }
     }
@@ -150,4 +169,17 @@ impl DiscSource {
         let p = self.video_ts()?.join("VIDEO_TS.IFO");
         p.is_file().then_some(p)
     }
+}
+
+/// The disc root for a path that is either a `BDMV` directory or contains one.
+fn bluray_root(path: &Path) -> Option<PathBuf> {
+    if path
+        .file_name()
+        .map(|n| n.eq_ignore_ascii_case("BDMV"))
+        .unwrap_or(false)
+        && path.is_dir()
+    {
+        return Some(path.parent().unwrap_or(path).to_path_buf());
+    }
+    path.join("BDMV").is_dir().then(|| path.to_path_buf())
 }

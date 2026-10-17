@@ -5,7 +5,8 @@
 //! Unknown keys and malformed lines are ignored so a hand-edited file never
 //! breaks a run.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -146,6 +147,73 @@ pub fn config_path() -> Option<PathBuf> {
 /// the guide can walk them through the settings screen before scanning.
 pub fn exists() -> bool {
     config_path().is_some_and(|path| path.exists())
+}
+
+/// Path of the AACS key database imported through the settings screen.
+///
+/// This is deliberately separate from the `aacs/KEYDB.cfg` files libaacs and
+/// VLC use: packrat keeps its own copy, so importing one survives the original
+/// being moved and packrat never writes into another application's settings.
+pub fn keydb_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("packrat").join("KEYDB.cfg"))
+}
+
+/// The imported KEYDB, when one is present.
+pub fn imported_keydb() -> Option<PathBuf> {
+    keydb_path().filter(|path| path.is_file())
+}
+
+/// Copy a `KEYDB.cfg` into packrat's managed location, replacing any previous
+/// copy, and return the path written.
+///
+/// The source is read as text before anything is written, so a binary or
+/// unreadable file is refused without disturbing an existing import.
+pub fn import_keydb(source: &Path) -> Result<PathBuf> {
+    let Some(destination) = keydb_path() else {
+        anyhow::bail!("no configuration directory for packrat");
+    };
+    import_keydb_to(source, &destination)
+}
+
+fn import_keydb_to(source: &Path, destination: &Path) -> Result<PathBuf> {
+    let text =
+        std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
+    if text.trim().is_empty() {
+        anyhow::bail!("{} is empty; choose a KEYDB.cfg file", source.display());
+    }
+    write_private(destination, text.as_bytes())?;
+    Ok(destination.to_path_buf())
+}
+
+/// Write a settings file that only the current user can read where the platform
+/// supports it. A KEYDB carries key material, so it must not inherit a
+/// permissive umask the way an ordinary config file might.
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Platform configuration directory.
@@ -312,5 +380,72 @@ unknown = 3
             assert_eq!(expand_tilde("~/media"), PathBuf::from(home).join("media"));
         }
         assert_eq!(expand_tilde("/mnt/media"), PathBuf::from("/mnt/media"));
+    }
+
+    #[test]
+    fn imports_keydb_text_and_replaces_an_older_copy() {
+        let dir = std::env::temp_dir().join(format!("packrat-keydb-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("source.cfg");
+        let destination = dir.join("settings").join("KEYDB.cfg");
+
+        let first = "\
+0x0000000000000000000000000000000000000000 = V 00000000000000000000000000000000 ; test
+";
+        std::fs::write(&source, first).expect("write source");
+        assert_eq!(
+            import_keydb_to(&source, &destination).expect("import"),
+            destination
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read imported"),
+            first
+        );
+
+        let second = "\
+| DISCID | 0x0000000000000000000000000000000000000000 | test
+| VUK | 0x00000000000000000000000000000000
+";
+        std::fs::write(&source, second).expect("write replacement");
+        import_keydb_to(&source, &destination).expect("replace");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read replacement"),
+            second
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_an_empty_keydb_without_replacing_an_import() {
+        let dir = std::env::temp_dir().join(format!("packrat-keydb-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = dir.join("empty.cfg");
+        let destination = dir.join("settings").join("KEYDB.cfg");
+        std::fs::write(&source, "  \n").expect("write empty source");
+
+        let error = import_keydb_to(&source, &destination).expect_err("empty import");
+        assert!(format!("{error:#}").contains("empty"));
+        assert!(
+            !destination.exists(),
+            "an empty file must not create or replace the managed copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

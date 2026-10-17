@@ -81,11 +81,15 @@ pub fn classify(disc: &DiscModel) -> Classification {
     let longest_duration = longest.duration.unwrap_or_default();
 
     // Several independent titles of episode length => a normal episodic disc.
+    // A year on the label plus one dominant feature is the exception: a movie
+    // disc with long featurettes is not a season, even though those extras sit
+    // in the episode-length band.
     let episode_like = content
         .iter()
         .filter(|t| is_episode_length(t.duration.unwrap_or_default()))
         .count();
-    if episode_like >= 2 {
+    let movie_like_label = year_label && !season_label && longest_duration >= MOVIE_MIN;
+    if episode_like >= 2 && !movie_like_label {
         let confidence = if season_label { 90 } else { 80 };
         return Classification {
             kind: DiscKind::TvSeries,
@@ -724,6 +728,25 @@ mod tests {
             titles,
         };
         assert_eq!(classify(&disc).kind, DiscKind::TvSeries);
+    }
+
+    #[test]
+    fn a_movie_with_long_extras_is_not_a_season() {
+        let mut feature = title_with((0..8).map(|_| secs(16 * 60)).collect());
+        feature.number = 1;
+        let mut extra_one = title_with(vec![secs(28 * 60)]);
+        extra_one.number = 2;
+        let mut extra_two = title_with(vec![secs(30 * 60)]);
+        extra_two.number = 3;
+
+        let disc = DiscModel {
+            volume_id: "SOME_FILM_2018".into(),
+            provider_id: String::new(),
+            vts_count: 1,
+            titles: vec![feature, extra_one, extra_two],
+        };
+
+        assert_eq!(classify(&disc).kind, DiscKind::Movie);
     }
 
     fn block_title(number: u16, block: &[u64], repeats: usize) -> Title {

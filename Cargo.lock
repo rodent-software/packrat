@@ -2528,16 +2528,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-mpegts"
-version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a72bdd896ae71cd76be5bd92999aa2ce35e2a2f7f05803f9cb3df3672c78679"
-dependencies = [
- "oxideav-core",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "packrat"
 version = "0.1.0-rc.4"
 dependencies = [
@@ -2559,7 +2549,6 @@ dependencies = [
  "oxideav-core",
  "oxideav-dvd",
  "oxideav-mkv",
- "oxideav-mpegts",
  "serde",
  "serde_json",
  "sha1",

@@ -34,8 +34,6 @@ libc = "0.2"
 
 # Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
 oxideav-dvd = "0.0.4"
-# MPEG-TS demuxer for the clean 188-byte stream TitleSource emits.
-oxideav-mpegts = "0.0.3"
 # Pure-Rust Matroska reader/writer, codec-agnostic.
 oxideav-mkv = "0.0.10"
 # Shared media types (Packet / StreamInfo / CodecParameters) used by the muxer API.

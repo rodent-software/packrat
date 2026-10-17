@@ -14,7 +14,6 @@ thiserror.workspace = true
 aes = "0.8"
 sha1 = "0.10"
 oxideav-dvd.workspace = true
-oxideav-mpegts.workspace = true
 oxideav-mkv.workspace = true
 oxideav-core.workspace = true
 serde.workspace = true

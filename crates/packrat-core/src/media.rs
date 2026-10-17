@@ -10,36 +10,14 @@
 
 pub(crate) use oxideav_core::packet::PacketFlags;
 pub(crate) use oxideav_core::{
-    CodecId, CodecParameters, Error as MediaError, Packet, ReadSeek, StreamInfo, TimeBase,
-    WriteSeek,
+    CodecId, CodecParameters, Error as MediaError, Packet, StreamInfo, TimeBase, WriteSeek,
 };
 
 use oxideav_core::Muxer;
 
-/// Complete MPEG-TS demuxer over a byte-addressable title stream.
-pub(crate) struct TsDemuxer {
-    inner: Box<dyn oxideav_core::Demuxer>,
-}
+mod ts;
 
-impl TsDemuxer {
-    pub(crate) fn open(reader: Box<dyn ReadSeek>) -> Result<Self, MediaError> {
-        let inner = oxideav_mpegts::demuxer::open(reader, &oxideav_core::NullCodecResolver)?;
-        Ok(Self { inner })
-    }
-
-    pub(crate) fn streams(&self) -> &[StreamInfo] {
-        self.inner.streams()
-    }
-
-    /// Next PES packet, or `None` at end of stream.
-    pub(crate) fn next_packet(&mut self) -> Result<Option<Packet>, MediaError> {
-        match self.inner.next_packet() {
-            Ok(packet) => Ok(Some(packet)),
-            Err(MediaError::Eof) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
+pub(crate) use ts::TsDemuxer;
 
 /// Matroska writer used by both the DVD and Blu-ray paths.
 pub(crate) struct MatroskaMuxer {

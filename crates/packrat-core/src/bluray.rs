@@ -1,9 +1,10 @@
 //! Blu-ray structure and title remuxing.
 //!
 //! Blu-ray metadata (`BDMV/`, playlists, clip info) is not encrypted; the
-//! `.m2ts` streams are. The metadata is read through `oxideav-bluray`, the
-//! streams are decrypted through the user-supplied `KEYDB.cfg`, and the clean
-//! 188-byte MPEG-TS that comes out is demuxed and written to Matroska.
+//! `.m2ts` streams are. Playlists are parsed by the packrat-owned `mpls`
+//! module, M2TS source packets and AACS units are read by `source`/`aacs`,
+//! and the clean 188-byte MPEG-TS that comes out is demuxed and written to
+//! Matroska.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -17,8 +18,10 @@ use crate::media::{
     avc_config_record, MatroskaMuxer, Packet, PacketFlags, StreamInfo, TimeBase, TsDemuxer,
     WriteSeek,
 };
-use oxideav_bluray::bdmv::mpls::PlayListMpls;
-use oxideav_bluray::{Disc, TitleInfo, TitleKind, TitleSource, TrackKind, VideoFormat};
+
+mod aacs;
+mod mpls;
+mod source;
 
 use crate::disc::{DiscModel, Title};
 use crate::error::DiscError;
@@ -63,21 +66,25 @@ pub fn read_disc(root: &Path) -> Result<DiscModel, DiscError> {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        let Ok(playlist) = PlayListMpls::parse(&bytes) else {
+        let Ok(playlist) = mpls::parse(&bytes) else {
             continue;
         };
         let duration_ticks = playlist.duration_90k();
         if duration_ticks == 0 {
             continue;
         }
-        let spans = playlist.chapters_with_duration();
+        let spans = playlist.chapter_spans();
         let duration = Some(Duration::from_secs_f64(duration_ticks as f64 / 90_000.0));
         let chapter_durations: Vec<Duration> = if spans.is_empty() {
             duration.into_iter().collect()
         } else {
             spans
                 .iter()
-                .map(|span| Duration::from_secs_f64(span.duration_90k() as f64 / 90_000.0))
+                .map(|span| {
+                    Duration::from_secs_f64(
+                        span.end_pts_90k.saturating_sub(span.start_pts_90k) as f64 / 90_000.0,
+                    )
+                })
                 .collect()
         };
         let chapters = u16::try_from(chapter_durations.len().max(1)).unwrap_or(u16::MAX);
@@ -87,13 +94,12 @@ pub fn read_disc(root: &Path) -> Result<DiscModel, DiscError> {
         // sequence, not the duration: two different episodes can be the same
         // length and still be different content.
         let signature = playlist
-            .play_list
             .play_items
             .iter()
             .map(|item| {
                 format!(
                     "{}:{}:{}",
-                    item.clip_information_file_name, item.in_time_ticks, item.out_time_ticks
+                    item.clip_id, item.in_time_ticks, item.out_time_ticks
                 )
             })
             .collect::<Vec<_>>()
@@ -111,10 +117,9 @@ pub fn read_disc(root: &Path) -> Result<DiscModel, DiscError> {
                 vts: 0,
                 vts_ttn: 0,
                 angles: playlist
-                    .play_list
                     .play_items
                     .iter()
-                    .map(|item| item.num_angles())
+                    .map(|item| item.angles)
                     .min()
                     .unwrap_or(1),
                 chapters,
@@ -170,54 +175,21 @@ pub fn remux_title(
     }
 
     let root = source.root();
-    let disc = mount(root)?;
-    let info = disc
-        .titles()
-        .iter()
-        .find(|info| info.playlist_id == title.number && info.kind == TitleKind::Hdmv)
-        .cloned()
-        .unwrap_or_else(|| TitleInfo {
-            id: title.number,
-            kind: TitleKind::Hdmv,
-            playlist_id: title.number,
-            duration_ticks: title
-                .duration
-                .map(|duration| (duration.as_secs_f64() * 90_000.0) as u64)
-                .unwrap_or(0),
-            languages: Vec::new(),
-        });
+    let playlist = read_playlist(root, title.number)?;
 
     let decryptor = if root.join("AACS").is_dir() && !title_contents_are_clear(root, title.number) {
-        match oxideav_bluray::aacs_adapter::try_resolve_aacs_with_keydb(root, keydb) {
+        match aacs::open(root, keydb) {
             Ok(Some(decryptor)) => Some(decryptor),
-            Ok(None) => {
-                return Err(DiscError::AacsKey(
-                    "no KEYDB.cfg entry for this Blu-ray; import a KEYDB with its VUK \
-                     (or a device key and KCD) in settings"
-                        .to_string(),
-                ))
-            }
+            Ok(None) => None,
             Err(error) => return Err(DiscError::AacsKey(error.to_string())),
         }
     } else {
         None
     };
 
-    let mut source_reader = disc
-        .open_title(&info, decryptor)
+    let source_reader = source::TitleSource::open(root, &playlist, decryptor)
         .map_err(|error| DiscError::BluRay(format!("opening title: {error}")))?;
-    // `TitleSource` opens at the first clip's file start, which can carry
-    // material before the PlayItem IN point; seek to title PTS 0 so the remux
-    // begins at the title's own keyframe. The clip may also continue past the
-    // PlayItem OUT point; the muxer still sees the title's leading frames at
-    // the right timestamps, which is what matters for a correct start.
-    let start_byte = source_reader
-        .seek_to(0)
-        .map_err(|error| DiscError::BluRay(format!("seeking to title start: {error}")))?;
-    let bytes_total = source_reader
-        .output_total()
-        .saturating_sub(start_byte)
-        .max(1);
+    let bytes_total = source_reader.output_total().max(1);
     let read_bytes = Arc::new(AtomicU64::new(0));
     let reader = TitleReader {
         inner: source_reader,
@@ -241,19 +213,19 @@ pub fn remux_title(
                 "{codec} Blu-ray video is not supported yet (H.264 only)"
             )));
         }
-        let (width, height) = playlist_dimensions(root, title.number).ok_or_else(|| {
+        let (width, height) = playlist_dimensions(&playlist).ok_or_else(|| {
             DiscError::Remux("Blu-ray playlist carries no primary video format".into())
         })?;
         streams[index].params.width = Some(width);
         streams[index].params.height = Some(height);
     }
-    apply_track_metadata(&disc, &info, &mut streams);
+    apply_track_metadata(&playlist, &mut streams);
 
     // Buffer up to the first access unit that carries both the IDR slice and
     // the SPS/PPS. Blu-ray often puts a short black/logo leader before the
     // feature; starting on that first IDR keeps the movie's own timestamps
     // and gives Matroska a valid CodecPrivate.
-    let title_start = playlist_start_pts(root, title.number);
+    let title_start = playlist.start_pts_90k();
     let mut pending = Vec::new();
     let mut parameter_sets: Option<Vec<u8>> = None;
     let mut have_avcc = video.is_none();
@@ -293,7 +265,7 @@ pub fn remux_title(
     }
     let base_pts = Some(title_start as i64);
 
-    let spans = disc.chapter_spans(&info);
+    let spans = playlist.chapter_spans();
     let temp = partial_path(out);
     if let Some(parent) = temp.parent() {
         if !parent.as_os_str().is_empty() {
@@ -381,10 +353,6 @@ pub fn remux_title(
     Ok(report)
 }
 
-fn mount(root: &Path) -> Result<Disc, DiscError> {
-    Disc::mount(root).map_err(|error| DiscError::BluRay(format!("reading structure: {error}")))
-}
-
 /// Whether the stream files are already clear despite an `AACS/` directory.
 ///
 /// A MakeMKV decrypted backup keeps the AACS tree but replaces the ciphertext;
@@ -426,15 +394,15 @@ fn title_contents_are_clear(root: &Path, playlist_id: u16) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return contents_are_clear(root);
     };
-    let Ok(playlist) = PlayListMpls::parse(&bytes) else {
+    let Ok(playlist) = mpls::parse(&bytes) else {
         return contents_are_clear(root);
     };
     let mut sampled = 0usize;
-    for item in &playlist.play_list.play_items {
+    for item in &playlist.play_items {
         let clip = root
             .join("BDMV")
             .join("STREAM")
-            .join(format!("{}.m2ts", item.clip_information_file_name));
+            .join(format!("{}.m2ts", item.clip_id));
         if !clip_is_clear(&clip) {
             return false;
         }
@@ -443,7 +411,7 @@ fn title_contents_are_clear(root: &Path, playlist_id: u16) -> bool {
             break;
         }
     }
-    sampled > 0 && sampled == playlist.play_list.play_items.len().min(8)
+    sampled > 0 && sampled == playlist.play_items.len().min(8)
 }
 
 fn clip_is_clear(path: &Path) -> bool {
@@ -460,11 +428,11 @@ fn clip_is_clear(path: &Path) -> bool {
             .all(|packet| packet.get(4) == Some(&0x47))
 }
 
-/// `TitleSource` is byte-addressable but its `SeekFrom::End` walks the whole
-/// title. The TS demuxer asks for the end once, only to probe duration, so hide
-/// the end from it and keep the streaming path cheap.
+/// The TS demuxer asks for the end once, only to probe duration. Answer with
+/// zero so opening a title never walks the whole clip list just to learn its
+/// length; progress uses the reader's precomputed total instead.
 struct TitleReader {
-    inner: TitleSource,
+    inner: source::TitleSource,
     read_bytes: Arc<AtomicU64>,
 }
 
@@ -848,76 +816,53 @@ fn contains_nal_type(data: &[u8], nal_type: u8) -> bool {
 /// Metadata from the playlist: video geometry and per-track languages. The
 /// MPEG-TS PMT does not carry the Blu-ray language table, and the MKV muxer
 /// would otherwise default every track to `eng`.
-fn apply_track_metadata(disc: &Disc, info: &TitleInfo, streams: &mut [StreamInfo]) {
-    let catalogue = disc.title_streams(info);
-    let mut audio = catalogue
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::PrimaryAudio);
-    let mut subtitles = catalogue
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::PgSubtitle);
+fn apply_track_metadata(playlist: &mpls::Playlist, streams: &mut [StreamInfo]) {
+    let audio_languages = playlist.audio_languages();
+    let mut audio = audio_languages.iter();
+    let subtitle_languages = playlist.pg_languages();
+    let mut subtitles = subtitle_languages.iter();
 
     for stream in streams.iter_mut() {
         match stream.params.codec_id.as_str() {
             "h264" | "hevc" | "vc1" | "mpeg2video" => {}
             "hdmv_pgs_subtitle" => {
-                if let Some(track) = subtitles.next() {
-                    stream.params.language = track.language.clone();
+                if let Some(language) = subtitles.next() {
+                    stream.params.language = language.clone();
                 }
             }
             _ => {
-                if let Some(track) = audio.next() {
-                    stream.params.language = track.language.clone();
+                if let Some(language) = audio.next() {
+                    stream.params.language = language.clone();
                 }
             }
         }
     }
 }
 
-fn playlist_start_pts(root: &Path, playlist_id: u16) -> u64 {
+fn read_playlist(root: &Path, playlist_id: u16) -> Result<mpls::Playlist, DiscError> {
     let path = root
         .join("BDMV")
         .join("PLAYLIST")
         .join(format!("{playlist_id:05}.mpls"));
-    let Ok(bytes) = std::fs::read(path) else {
-        return 0;
-    };
-    let Ok(playlist) = PlayListMpls::parse(&bytes) else {
-        return 0;
-    };
-    playlist
-        .play_list
-        .play_items
-        .first()
-        .map(|item| u64::from(item.in_time_ticks) * 2)
-        .unwrap_or(0)
+    let bytes = std::fs::read(&path).map_err(|source| DiscError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    mpls::parse(&bytes)
+        .map_err(|error| DiscError::BluRay(format!("parsing playlist {}: {error}", path.display())))
 }
 
-fn playlist_dimensions(root: &Path, playlist_id: u16) -> Option<(u32, u32)> {
-    let path = root
-        .join("BDMV")
-        .join("PLAYLIST")
-        .join(format!("{playlist_id:05}.mpls"));
-    let bytes = std::fs::read(path).ok()?;
-    let playlist = PlayListMpls::parse(&bytes).ok()?;
-    let video = playlist
-        .play_list
-        .play_items
-        .iter()
-        .find_map(|item| item.stn_table.primary_video.first())?;
-    let format = video.video_format_kind();
-    let height = format.vertical_lines()?;
-    let width = match format {
-        VideoFormat::Video480i | VideoFormat::Video480p => 720,
-        VideoFormat::Video576i | VideoFormat::Video576p => 720,
-        VideoFormat::Video720p => 1280,
-        VideoFormat::Video1080i | VideoFormat::Video1080p => 1920,
-        VideoFormat::Video2160p => 3840,
-        VideoFormat::Other(_) => return None,
+fn playlist_dimensions(playlist: &mpls::Playlist) -> Option<(u32, u32)> {
+    let format = playlist.primary_video_format()?;
+    let (width, height) = match format {
+        1 | 3 => (720, 480),
+        2 | 7 => (720, 576),
+        4 | 6 => (1920, 1080),
+        5 => (1280, 720),
+        8 => (3840, 2160),
+        _ => return None,
     };
-    Some((width, u32::from(height)))
+    Some((width, height))
 }
 
 fn ticks_to_ns(ticks: u64) -> u64 {

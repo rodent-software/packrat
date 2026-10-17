@@ -39,9 +39,9 @@ See [Installation](installation.md) for the details and per-platform sources.
 ## Blu-ray
 
 Blu-ray structure and remuxing live in `packrat-core/src/bluray.rs`. The
-structure parser and AACS hook come from a local fork of `oxideav-bluray` under
-`vendor/`, which fixes the `index.bdmv` object layout and accepts an explicit
-`KEYDB.cfg` path. AACS keys remain user-supplied; see [Blu-ray and AACS
+playlist parser (`bluray/mpls.rs`), M2TS source-packet reader
+(`bluray/source.rs`), and AACS VUK/CPS-unit decryptor (`bluray/aacs.rs`) are
+packrat-owned. AACS keys remain user-supplied; see [Blu-ray and AACS
 keys](blu-ray.md).
 
 External media plumbing sits behind `packrat-core/src/media.rs`: the MPEG-TS

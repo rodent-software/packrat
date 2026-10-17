@@ -2499,27 +2499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-aacs"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1e75faea45b095de114be637288a08ae66b7caa6843a72708f94d5d2eef9fe9"
-dependencies = [
- "aes",
- "oxideav-core",
- "sha1",
-]
-
-[[package]]
-name = "oxideav-bluray"
-version = "0.0.4"
-dependencies = [
- "libc",
- "libloading",
- "oxideav-aacs",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "oxideav-core"
 version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2574,15 +2553,16 @@ dependencies = [
 name = "packrat-core"
 version = "0.1.0-rc.4"
 dependencies = [
+ "aes",
  "libc",
  "libloading",
- "oxideav-bluray",
  "oxideav-core",
  "oxideav-dvd",
  "oxideav-mkv",
  "oxideav-mpegts",
  "serde",
  "serde_json",
+ "sha1",
  "strsim",
  "thiserror 2.0.21",
  "ureq",

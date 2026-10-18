@@ -163,7 +163,7 @@ fn backup(app: &App) -> Element<'_, Message> {
 
     if matches!(&app.source, Some(DiscSource::BluRay { .. })) {
         body = body.push(notice_block(
-            "Blu-ray support handles H.264 titles; HEVC, VC-1 and MPEG-2 video are not supported yet.",
+            "Blu-ray support handles H.264, HEVC, VC-1 and MPEG-2 video.",
         ));
     }
 

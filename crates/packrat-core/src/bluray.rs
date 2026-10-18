@@ -22,6 +22,7 @@ use crate::media::{
 mod aacs;
 mod mpls;
 mod source;
+mod video;
 
 use crate::disc::{DiscModel, Title};
 use crate::error::DiscError;
@@ -29,6 +30,7 @@ use crate::remux::{
     partial_path, replace_file, PartialFile, RemuxPhase, RemuxProgress, RemuxReport,
 };
 use crate::source::DiscSource;
+use video::{VideoAssembler, VideoCodec};
 
 /// Read a mounted Blu-ray's playlists into the same model the DVD path uses.
 ///
@@ -202,20 +204,26 @@ pub fn remux_title(
     let video = streams.iter().position(|stream| {
         matches!(
             stream.params.codec_id.as_str(),
-            "h264" | "hevc" | "vc1" | "mpeg2video"
+            "h264" | "hevc" | "h265" | "vc1" | "mpeg2video"
         )
     });
 
-    if let Some(index) = video {
-        let codec = streams[index].params.codec_id.as_str().to_string();
-        if codec != "h264" {
-            return Err(DiscError::Remux(format!(
-                "{codec} Blu-ray video is not supported yet (H.264 only)"
-            )));
-        }
-        let (width, height) = playlist_dimensions(&playlist).ok_or_else(|| {
+    let video_codec =
+        video.and_then(|index| VideoCodec::from_id(streams[index].params.codec_id.as_str()));
+    if video.is_some() && video_codec.is_none() {
+        let codec = streams[video.unwrap()].params.codec_id.as_str().to_string();
+        return Err(DiscError::Remux(format!(
+            "{codec} Blu-ray video is not supported"
+        )));
+    }
+    let video_dimensions = if video.is_some() {
+        Some(playlist_dimensions(&playlist).ok_or_else(|| {
             DiscError::Remux("Blu-ray playlist carries no primary video format".into())
-        })?;
+        })?)
+    } else {
+        None
+    };
+    if let (Some(index), Some((width, height))) = (video, video_dimensions) {
         streams[index].params.width = Some(width);
         streams[index].params.height = Some(height);
     }
@@ -228,24 +236,27 @@ pub fn remux_title(
     let title_start = playlist.start_pts_90k();
     let mut pending = Vec::new();
     let mut parameter_sets: Option<Vec<u8>> = None;
-    let mut have_avcc = video.is_none();
-    while pending.len() < 4000 && !have_avcc {
+    let mut have_start = video.is_none();
+    while pending.len() < 4000 && !have_start {
         match demux.next_packet() {
             Ok(Some(packet)) => {
-                if Some(packet.stream_index) == video.map(|index| index as u32) {
-                    if contains_nal_type(&packet.data, 7) {
-                        let config = avc_config_record(&packet.data);
+                if let (Some(index), Some(codec), Some((width, height))) =
+                    (video, video_codec, video_dimensions)
+                {
+                    if codec.has_parameter_set(&packet.data) {
+                        let config = codec.config_record(&packet.data, width, height);
                         if !config.is_empty() {
                             parameter_sets = Some(config);
                         }
                     }
                     if packet.pts.is_some_and(|pts| pts >= title_start as i64)
-                        && contains_nal_type(&packet.data, 5)
+                        && codec.is_keyframe(&packet.data)
+                        && (!codec.needs_config() || parameter_sets.is_some())
                     {
                         if let Some(config) = parameter_sets.take() {
-                            streams[video.unwrap()].params.extradata = config;
-                            have_avcc = true;
+                            streams[index].params.extradata = config;
                         }
+                        have_start = true;
                     }
                 }
                 pending.push(packet);
@@ -258,9 +269,9 @@ pub fn remux_title(
             }
         }
     }
-    if video.is_some() && !have_avcc {
+    if video.is_some() && !have_start {
         return Err(DiscError::Remux(
-            "could not find the H.264 SPS/PPS in the Blu-ray stream".into(),
+            "could not find the Blu-ray video parameter sets / first keyframe".into(),
         ));
     }
     let base_pts = Some(title_start as i64);
@@ -311,12 +322,15 @@ pub fn remux_title(
             read_bytes: &read_bytes,
             bytes_total,
         };
-        let mut video_assembler = AuAssembler::new(video.map(|index| index as u32), title_start);
+        let mut video_assembler = video_codec
+            .map(|codec| VideoAssembler::new(codec, video.map(|index| index as u32), title_start));
         let mut audio_assembler = AudioAssembler::new(&streams);
 
         for packet in pending {
             if Some(packet.stream_index) == video.map(|index| index as u32) {
-                video_assembler.feed(&mut writer, packet)?;
+                if let Some(assembler) = video_assembler.as_mut() {
+                    assembler.feed(&mut writer, packet)?;
+                }
             } else {
                 audio_assembler.feed(&mut writer, packet)?;
             }
@@ -329,7 +343,9 @@ pub fn remux_title(
             match demux.next_packet() {
                 Ok(Some(packet)) => {
                     if Some(packet.stream_index) == video.map(|index| index as u32) {
-                        video_assembler.feed(&mut writer, packet)?;
+                        if let Some(assembler) = video_assembler.as_mut() {
+                            assembler.feed(&mut writer, packet)?;
+                        }
                     } else {
                         audio_assembler.feed(&mut writer, packet)?;
                     }
@@ -340,7 +356,9 @@ pub fn remux_title(
                 }
             }
         }
-        video_assembler.finish(&mut writer)?;
+        if let Some(assembler) = video_assembler.as_mut() {
+            assembler.finish(&mut writer)?;
+        }
         audio_assembler.finish(&mut writer)?;
     }
 
@@ -493,9 +511,55 @@ impl MuxWriter<'_> {
 /// Repacking each PES on its own feeds the decoder truncated slices, which
 /// shows up as macroblock/reference errors. This assembler carries bytes
 /// across PES boundaries and flushes on the next AUD.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NalKind {
+    H264,
+    Hevc,
+}
+
+impl NalKind {
+    fn aud(self) -> u8 {
+        match self {
+            Self::H264 => 9,
+            Self::Hevc => 35,
+        }
+    }
+
+    fn nal_type(self, byte: u8) -> u8 {
+        match self {
+            Self::H264 => byte & 0x1F,
+            Self::Hevc => (byte >> 1) & 0x3F,
+        }
+    }
+
+    fn is_key(self, data: &[u8]) -> bool {
+        match self {
+            Self::H264 => contains_nal_type(data, 5),
+            Self::Hevc => (16..=23).any(|kind| contains_nal_type_kind(data, kind, self)),
+        }
+    }
+
+    fn has_aud(self, data: &[u8]) -> bool {
+        contains_nal_type_kind(data, self.aud(), self)
+    }
+}
+
+fn contains_nal_type_kind(data: &[u8], wanted: u8, kind: NalKind) -> bool {
+    let mut pos = 0usize;
+    while let Some(relative) = find_start_code(&data[pos..]) {
+        let start = pos + relative + 3;
+        if start < data.len() && kind.nal_type(data[start]) == wanted {
+            return true;
+        }
+        pos = start;
+    }
+    false
+}
+
 struct AuAssembler {
     video: Option<u32>,
     title_start: u64,
+    kind: NalKind,
     carry: Vec<u8>,
     au: Vec<u8>,
     pts: Option<i64>,
@@ -504,10 +568,11 @@ struct AuAssembler {
 }
 
 impl AuAssembler {
-    fn new(video: Option<u32>, title_start: u64) -> Self {
+    fn new(video: Option<u32>, title_start: u64, kind: NalKind) -> Self {
         Self {
             video,
             title_start,
+            kind,
             carry: Vec::new(),
             au: Vec::new(),
             pts: None,
@@ -529,7 +594,7 @@ impl AuAssembler {
             if nal.len() <= prefix {
                 continue;
             }
-            if nal[prefix] & 0x1F == 9 && !self.au.is_empty() {
+            if self.kind.nal_type(nal[prefix]) == self.kind.aud() && !self.au.is_empty() {
                 self.flush(writer)?;
             }
             if self.pts.is_none() {
@@ -560,8 +625,8 @@ impl AuAssembler {
         let data = packetize_all(&self.au);
         if !self.started {
             if self.pts.is_some_and(|pts| pts >= self.title_start as i64)
-                && contains_nal_type(&self.au, 9)
-                && contains_nal_type(&self.au, 5)
+                && self.kind.has_aud(&self.au)
+                && self.kind.is_key(&self.au)
             {
                 self.started = true;
             } else {
@@ -572,7 +637,7 @@ impl AuAssembler {
             }
         }
         if !data.is_empty() {
-            let keyframe = contains_nal_type(&self.au, 5);
+            let keyframe = self.kind.is_key(&self.au);
             writer.write(Packet {
                 stream_index: self.video.unwrap_or(0),
                 time_base: TimeBase::new(1, 90_000),
@@ -824,7 +889,7 @@ fn apply_track_metadata(playlist: &mpls::Playlist, streams: &mut [StreamInfo]) {
 
     for stream in streams.iter_mut() {
         match stream.params.codec_id.as_str() {
-            "h264" | "hevc" | "vc1" | "mpeg2video" => {}
+            "h264" | "hevc" | "h265" | "vc1" | "mpeg2video" => {}
             "hdmv_pgs_subtitle" => {
                 if let Some(language) = subtitles.next() {
                     stream.params.language = language.clone();

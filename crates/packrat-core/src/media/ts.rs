@@ -334,7 +334,7 @@ fn codec_for(stream_type: u8) -> Option<(&'static str, MediaKind)> {
     match stream_type {
         0x02 => Some(("mpeg2video", MediaKind::Video)),
         0x1B => Some(("h264", MediaKind::Video)),
-        0x24 => Some(("hevc", MediaKind::Video)),
+        0x24 => Some(("h265", MediaKind::Video)),
         0xEA => Some(("vc1", MediaKind::Video)),
         0x80 => Some(("pcm_s16be", MediaKind::Audio)),
         0x81 => Some(("ac3", MediaKind::Audio)),

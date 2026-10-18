@@ -66,6 +66,7 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MPEG2" => "mpeg2video",
         "V_MPEG4/ISO/AVC" => "h264",
         "V_MPEGH/ISO/HEVC" => "h265",
+        "V_VC1" => "vc1",
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
         "V_MS/VFW/FOURCC" => return from_bitmapinfoheader(codec_private),
@@ -100,6 +101,7 @@ fn from_bitmapinfoheader(cp: &[u8]) -> CodecId {
     let fourcc_str = std::str::from_utf8(fourcc).unwrap_or("????");
     match fourcc_str {
         "FFV1" => CodecId::new("ffv1"),
+        "WVC1" | "WMV3" => CodecId::new("vc1"),
         other => CodecId::new(format!("mkv:BI/{other}")),
     }
 }
@@ -142,7 +144,8 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "mpeg1video" => "V_MPEG1",
         "mpeg2video" => "V_MPEG2",
         "h264" => "V_MPEG4/ISO/AVC",
-        "h265" => "V_MPEGH/ISO/HEVC",
+        "h265" | "hevc" => "V_MPEGH/ISO/HEVC",
+        "vc1" => "V_MS/VFW/FOURCC",
         "ffv1" => "V_FFV1",
         "subrip" => "S_TEXT/UTF8",
         "ssa" => "S_TEXT/SSA",
@@ -200,6 +203,14 @@ mod tests {
         // Subtitle.
         assert_round_trip("S_HDMV/PGS");
         assert_round_trip("S_HDMV/TEXTST");
+    }
+
+    #[test]
+    fn vc1_uses_bitmapinfoheader_mapping() {
+        assert_eq!(to_matroska(&CodecId::new("vc1")), Some("V_MS/VFW/FOURCC"));
+        let mut cp = vec![0u8; 40];
+        cp[16..20].copy_from_slice(b"WVC1");
+        assert_eq!(from_matroska("V_MS/VFW/FOURCC", &cp).as_str(), "vc1");
     }
 
     /// `A_DTS` and `A_TRUEHD` were added for BD passthrough. Locked

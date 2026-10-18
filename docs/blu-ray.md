@@ -1,9 +1,10 @@
 # Blu-ray and AACS keys
 
-Blu-ray scanning, AACS decryption, and remuxing are implemented for H.264
-titles read from a mounted disc. The remuxer assembles H.264 access units,
-TrueHD frames, and DTS-HD MA core plus extension frames before writing
-Matroska, so PES boundaries no longer have to line up with codec frames.
+Blu-ray scanning, AACS decryption, and remuxing are implemented for H.264,
+HEVC, VC-1, and MPEG-2 titles read from a mounted disc. The remuxer assembles
+video access units/frames, TrueHD frames, and DTS-HD MA core plus extension
+frames before writing Matroska, so PES boundaries no longer have to line up
+with codec frames.
 
 Blu-ray discs use **AACS** (Advanced Access Content System), not the CSS
 protection used by DVDs. AACS encrypts a disc's `.m2ts` streams with a per-disc
@@ -95,14 +96,13 @@ covered by this key path.
 
 ## Current limits
 
-- Video is remuxed for H.264 titles. HEVC, VC-1 and MPEG-2 Blu-ray video are
-  not handled yet.
+- Video is remuxed for H.264, HEVC, VC-1, and MPEG-2 titles. Dolby Vision
+  enhancement layers and 3D/MVC are not remuxed.
 - A rip takes the whole playlist. Chapter-range jobs (a TV episode that is one
   chapter range inside a longer playlist) are not supported yet.
 - The disc must be mounted so `BDMV/` is readable. A raw device with no mount
   is not handled yet.
 - HDMV playlists are backed up. BD-J-only discs, and BD-J menus, are not.
 - Forced-subtitle flags are not set on the remuxed subtitle tracks yet.
-- Dolby Vision, 3D/MVC, and other secondary-video layouts are not remuxed yet.
 - DTS-HD MA is carried as the core frame plus its extension in one block.
   A DTS track whose core is missing cannot be decoded.

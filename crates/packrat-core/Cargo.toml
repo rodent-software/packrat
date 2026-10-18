@@ -13,7 +13,6 @@ homepage.workspace = true
 thiserror.workspace = true
 aes = "0.8"
 sha1 = "0.10"
-oxideav-mkv.workspace = true
 oxideav-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

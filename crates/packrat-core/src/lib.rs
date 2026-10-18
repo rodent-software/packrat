@@ -16,6 +16,7 @@ pub mod identify;
 pub mod library;
 mod media;
 pub mod meta;
+mod mkv;
 pub mod movie;
 pub mod remux;
 pub mod source;

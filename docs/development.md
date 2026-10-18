@@ -44,12 +44,13 @@ playlist parser (`bluray/mpls.rs`), M2TS source-packet reader
 packrat-owned. AACS keys remain user-supplied; see [Blu-ray and AACS
 keys](blu-ray.md).
 
-The MPEG-TS/PES reader lives in `packrat-core/src/media/ts.rs`. The remaining
-external media plumbing — the Matroska writer, packet types, and AVC repacker —
-is reached through `media.rs` rather than imported directly by the title code.
-The DVD filesystem, IFO/PGC, VOB/MPEG-PS, and codec-header parsers live in
-`packrat-core/src/dvd/`, adapted from the MIT-licensed `oxideav-dvd` code (the
-license is kept alongside it). The DVD title-set facade in `disc.rs`
+The MPEG-TS/PES reader lives in `packrat-core/src/media/ts.rs`, and the
+Matroska writer/reader support lives in `packrat-core/src/mkv/`, adapted from
+the MIT-licensed `oxideav-mkv` code. `media.rs` is the seam those modules are
+reached through; only the shared `oxideav-core` packet/track types remain
+external. The DVD filesystem, IFO/PGC, VOB/MPEG-PS, and codec-header parsers
+live in `packrat-core/src/dvd/`, adapted from `oxideav-dvd` (licenses are kept
+alongside each adapted module). The DVD title-set facade in `disc.rs`
 (`DvdTitleSet`) keeps parser types out of the public API.
 
 ## Releases

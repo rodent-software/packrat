@@ -21,7 +21,7 @@ pub(crate) use ts::TsDemuxer;
 
 /// Matroska writer used by both the DVD and Blu-ray paths.
 pub(crate) struct MatroskaMuxer {
-    inner: oxideav_mkv::mux::MkvMuxer,
+    inner: crate::mkv::mux::MkvMuxer,
 }
 
 impl MatroskaMuxer {
@@ -30,7 +30,7 @@ impl MatroskaMuxer {
         streams: &[StreamInfo],
     ) -> Result<Self, MediaError> {
         Ok(Self {
-            inner: oxideav_mkv::mux::MkvMuxer::new_matroska(output, streams)?,
+            inner: crate::mkv::mux::MkvMuxer::new_matroska(output, streams)?,
         })
     }
 
@@ -48,7 +48,7 @@ impl MatroskaMuxer {
         self.inner
             .set_video_geometry(
                 stream_index,
-                oxideav_mkv::mux::MkvVideoGeometry::aspect_ratio(numerator, denominator),
+                crate::mkv::mux::MkvVideoGeometry::aspect_ratio(numerator, denominator),
             )
             .map(|_| ())
             .map_err(Into::into)
@@ -78,5 +78,5 @@ impl MatroskaMuxer {
 
 /// Build Matroska's AVCDecoderConfigurationRecord from Annex-B SPS/PPS.
 pub(crate) fn avc_config_record(data: &[u8]) -> Vec<u8> {
-    oxideav_mkv::avc::annexb_to_avcc(data).config_record
+    crate::mkv::avc::annexb_to_avcc(data).config_record
 }

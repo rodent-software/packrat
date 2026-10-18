@@ -9,6 +9,7 @@ pub mod detect;
 pub mod device;
 pub mod disc;
 pub mod drives;
+pub mod dvd;
 pub mod dvdcss;
 pub mod error;
 pub mod identify;

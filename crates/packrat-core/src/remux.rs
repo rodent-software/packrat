@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::media::{
-    CodecId, CodecParameters, MatroskaMuxer, Packet, PacketFlags, StreamInfo, TimeBase, WriteSeek,
-};
-use oxideav_dvd::vob::{
+use crate::dvd::vob::{
     looks_like_nav_pack, DvdSubstream, NavPack, PackHeader, PesPacket, AUDIO_SUBSTREAM_HEADER_LEN,
     SC_PADDING_STREAM, SC_PRIVATE_STREAM_1, SC_PRIVATE_STREAM_2, SC_SYSTEM_HEADER,
 };
-use oxideav_dvd::{
+use crate::dvd::{
     Ac3Header, AspectRatioCode, AudioAttributes, AudioCodingMode, AudioStreamControl,
     AudioSubstreamHeader, DtsHeader, DvdChapter, DvdTitle, PictureCodingExtension, PictureHeader,
     PictureStructure, SequenceHeader, SubpictureStreamControl, VtsIfo,
+};
+use crate::media::{
+    CodecId, CodecParameters, MatroskaMuxer, Packet, PacketFlags, StreamInfo, TimeBase, WriteSeek,
 };
 
 use crate::disc::{DvdTitleSet, Title};

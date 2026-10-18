@@ -47,10 +47,10 @@ keys](blu-ray.md).
 The MPEG-TS/PES reader lives in `packrat-core/src/media/ts.rs`. The remaining
 external media plumbing — the Matroska writer, packet types, and AVC repacker —
 is reached through `media.rs` rather than imported directly by the title code.
-The DVD title-set facade in `disc.rs` (`DvdTitleSet`) keeps `oxideav-dvd`'s
-parser types out of the public API. This is the seam used to replace each
-backend with a packrat-owned implementation while the disc and remux code stays
-put.
+The DVD filesystem, IFO/PGC, VOB/MPEG-PS, and codec-header parsers live in
+`packrat-core/src/dvd/`, adapted from the MIT-licensed `oxideav-dvd` code (the
+license is kept alongside it). The DVD title-set facade in `disc.rs`
+(`DvdTitleSet`) keeps parser types out of the public API.
 
 ## Releases
 

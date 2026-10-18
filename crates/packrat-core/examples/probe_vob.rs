@@ -20,7 +20,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use oxideav_dvd::vob::{
+use packrat_core::dvd::vob::{
     looks_like_nav_pack, PackHeader, PesPacket, SC_PADDING_STREAM, SC_PRIVATE_STREAM_2,
     SC_SYSTEM_HEADER,
 };
@@ -297,13 +297,13 @@ fn hex(bytes: &[u8]) -> String {
 /// The absolute sector `VTS_01_1.VOB` starts at, so a raw read lands on video.
 fn vob_base(device: &Path, vts: u8) -> Option<u64> {
     let mut file = packrat_core::drives::open_device(device).ok()?;
-    let disc = oxideav_dvd::DvdDisc::from_reader(&mut file).ok()?;
-    let partition = oxideav_dvd::udf::UdfVolume::open(&mut file)
+    let disc = packrat_core::dvd::DvdDisc::from_reader(&mut file).ok()?;
+    let partition = packrat_core::dvd::udf::UdfVolume::open(&mut file)
         .map(|udf| udf.partition_start_sector)
         .unwrap_or(0);
     disc.video_ts_files
         .iter()
-        .find(|f| matches!(f.kind, oxideav_dvd::DvdFileKind::VtsTitle { ts, vob: 1 } if ts == vts))
+        .find(|f| matches!(f.kind, packrat_core::dvd::DvdFileKind::VtsTitle { ts, vob: 1 } if ts == vts))
         .map(|f| partition + u64::from(f.lba))
 }
 

@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use oxideav_dvd::udf::UdfVolume;
-use oxideav_dvd::{DvdDisc, DvdFileKind};
+use crate::dvd::udf::UdfVolume;
+use crate::dvd::{DvdDisc, DvdFileKind};
 
 use crate::error::DiscError;
 
@@ -250,7 +250,7 @@ impl Seek for DeviceChainReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_dvd::DvdFile;
+    use crate::dvd::DvdFile;
 
     fn disc_with(files: Vec<DvdFile>) -> DvdDisc {
         DvdDisc {

@@ -63,7 +63,7 @@ fn main() {
 
     println!("\n== the disc's file table ==");
     let mut reader = drives::open_device(device).expect("the open succeeded above");
-    let disc = match oxideav_dvd::DvdDisc::from_reader(&mut reader) {
+    let disc = match packrat_core::dvd::DvdDisc::from_reader(&mut reader) {
         Ok(disc) => disc,
         Err(e) => {
             println!("  FAILED: {e}");
@@ -81,7 +81,7 @@ fn main() {
     // The offset every file address is added to. UDF entries are
     // partition-relative and ISO 9660 ones are already absolute, so this is the
     // number that decides whether the reads below land anywhere sensible.
-    let base = match oxideav_dvd::udf::UdfVolume::open(&mut reader) {
+    let base = match packrat_core::dvd::udf::UdfVolume::open(&mut reader) {
         Ok(udf) => {
             println!(
                 "  udf partition      {} (file addresses are relative to it)",

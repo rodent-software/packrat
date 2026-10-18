@@ -10,8 +10,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use oxideav_dvd::udf::UdfVolume;
-use oxideav_dvd::{DvdDisc, DvdFile, DvdFileKind, TtSrpt, VmgIfo, VtsIfo};
+use crate::dvd::udf::UdfVolume;
+use crate::dvd::{DvdDisc, DvdFile, DvdFileKind, TtSrpt, VmgIfo, VtsIfo};
 
 /// One parsed DVD video title set.
 ///

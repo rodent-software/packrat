@@ -20,7 +20,7 @@ fn open(device: &str) -> std::fs::File {
 
 /// The absolute sector the disc's UDF file entries are addressed from.
 fn base_sector(device: &str) -> u64 {
-    match oxideav_dvd::udf::UdfVolume::open(open(device)) {
+    match packrat_core::dvd::udf::UdfVolume::open(open(device)) {
         Ok(volume) => volume.partition_start_sector,
         Err(_) => 0,
     }
@@ -29,7 +29,7 @@ fn base_sector(device: &str) -> u64 {
 /// Copy just the `IFO` files off the device into a temporary `VIDEO_TS`, so the
 /// ordinary folder reader can be pointed at the same bytes.
 fn dump_ifos(device: &str) -> std::io::Result<PathBuf> {
-    let disc = oxideav_dvd::DvdDisc::open(device).expect("open device");
+    let disc = packrat_core::dvd::DvdDisc::open(device).expect("open device");
     let base = base_sector(device);
 
     let root = std::env::temp_dir().join(format!("packrat-ifo-{}", std::process::id()));
@@ -63,14 +63,14 @@ fn summary(label: &str, titles: &[packrat_core::Title]) {
 /// The parser's own view of the disc, straight from the dumped `IFO` files.
 fn analyse(video_ts: &Path) {
     let main = std::fs::read(video_ts.join("VIDEO_TS.IFO")).expect("read VIDEO_TS.IFO");
-    let vmg = oxideav_dvd::VmgIfo::parse(&main).expect("parse VMGI");
+    let vmg = packrat_core::dvd::VmgIfo::parse(&main).expect("parse VMGI");
     println!(
         "\nVMGI: title_sets {}  tt_srpt_sector {}",
         vmg.number_of_title_sets, vmg.tt_srpt_sector
     );
 
     let offset = vmg.tt_srpt_sector as usize * SECTOR as usize;
-    let tt = oxideav_dvd::TtSrpt::parse(&main[offset..]).expect("parse TT_SRPT");
+    let tt = packrat_core::dvd::TtSrpt::parse(&main[offset..]).expect("parse TT_SRPT");
     println!(
         "TT_SRPT: declared {} entries, parsed {}",
         tt.title_count,
@@ -94,7 +94,7 @@ fn analyse(video_ts: &Path) {
         let Ok(buf) = std::fs::read(&path) else {
             continue;
         };
-        match oxideav_dvd::VtsIfo::parse(&buf, nu8) {
+        match packrat_core::dvd::VtsIfo::parse(&buf, nu8) {
             Ok(vts) => {
                 println!(
                     "VTS {:02}: declared {} titles, parsed {} titles, {} pgcs",
@@ -125,7 +125,7 @@ fn analyse(video_ts: &Path) {
 fn main() {
     let device = std::env::args().nth(1).unwrap_or_else(|| "/dev/sr0".into());
 
-    let udf = oxideav_dvd::DvdDisc::open(&device).expect("open device (UDF)");
+    let udf = packrat_core::dvd::DvdDisc::open(&device).expect("open device (UDF)");
     println!("UDF volume_id = {}", udf.volume_id);
     println!(
         "\nUDF partition starts at sector {} (absolute = that + lba)",

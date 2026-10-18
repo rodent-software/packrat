@@ -32,8 +32,6 @@ libloading = "0.8"
 # open tray via the kernel's autoclose behaviour.
 libc = "0.2"
 
-# Pure-Rust DVD-Video structure parsing (ISO9660/UDF, IFO/PGC, VOB demux, VobSub).
-oxideav-dvd = "0.0.4"
 # Pure-Rust Matroska reader/writer, codec-agnostic.
 oxideav-mkv = "0.0.10"
 # Shared media types (Packet / StreamInfo / CodecParameters) used by the muxer API.

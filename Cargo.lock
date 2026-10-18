@@ -2510,15 +2510,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-dvd"
-version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c29921403d9a6bb319a14bab63a4b7a81200c1c3893528de931e782d5650d2dc"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-mkv"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2547,7 +2538,6 @@ dependencies = [
  "libc",
  "libloading",
  "oxideav-core",
- "oxideav-dvd",
  "oxideav-mkv",
  "serde",
  "serde_json",

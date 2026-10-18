@@ -32,7 +32,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_core::Result;
+use crate::media::core::Result;
 
 use crate::mkv::{ebml, ids};
 

@@ -12,7 +12,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_core::{Error, Result};
+use crate::media::core::{Error, Result};
 
 /// "Unknown size" marker used in streamable Segment headers (all payload bits 1).
 pub const VINT_UNKNOWN_SIZE: u64 = u64::MAX;

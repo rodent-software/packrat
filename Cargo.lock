@@ -2499,17 +2499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-core"
-version = "0.1.36"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a78b502f679c580ceb7cc834d23f80821673b0a393a3083d54ef82668bb9c028"
-dependencies = [
- "bytemuck",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "packrat"
 version = "0.1.0-rc.4"
 dependencies = [
@@ -2528,7 +2517,6 @@ dependencies = [
  "aes",
  "libc",
  "libloading",
- "oxideav-core",
  "serde",
  "serde_json",
  "sha1",

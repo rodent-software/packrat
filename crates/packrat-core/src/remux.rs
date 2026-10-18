@@ -3,7 +3,7 @@
 //! A mounted disc gives us the title's VOBs as ordinary files rather than one
 //! flat image, so we present `VTS_xx_1.VOB`…`VTS_xx_9.VOB` as a single virtual
 //! sector-addressable reader and stream their MPEG-PS packs through the
-//! `oxideav-dvd` PES parser into `oxideav-mkv`'s muxer. Video and audio are
+//! in-tree DVD PES parser into the in-tree Matroska muxer. Video and audio are
 //! copied bit-for-bit — there is no re-encode.
 
 use std::fs::File;

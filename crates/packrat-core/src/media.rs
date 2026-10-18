@@ -1,19 +1,18 @@
 //! Internal media plumbing boundary.
 //!
 //! The ripping modules talk to MPEG-TS demuxing, Matroska muxing, and the
-//! packet/track types through this module. Today the implementations are the
-//! `oxideav` crates; keeping the `use` statements here means each one can be
-//! replaced without touching the disc or title code.
+//! packet/track types through this module. The implementations are packrat's
+//! own; this module keeps the seam used by the disc and title code.
 //!
 //! This is deliberately a narrow wrapper, not a second media framework. The
 //! wrappers expose only the calls packrat makes today.
 
-pub(crate) use oxideav_core::packet::PacketFlags;
-pub(crate) use oxideav_core::{
-    CodecId, CodecParameters, Error as MediaError, Packet, StreamInfo, TimeBase, WriteSeek,
-};
+pub mod core;
 
-use oxideav_core::Muxer;
+pub(crate) use core::{
+    CodecId, CodecParameters, Error as MediaError, Muxer, Packet, PacketFlags, StreamInfo,
+    TimeBase, WriteSeek,
+};
 
 mod ts;
 

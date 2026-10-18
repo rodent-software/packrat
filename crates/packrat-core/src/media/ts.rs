@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 
-use oxideav_core::{
+use crate::media::core::{
     CodecId, CodecParameters, Error as MediaError, Packet, ReadSeek, StreamInfo, TimeBase,
 };
 

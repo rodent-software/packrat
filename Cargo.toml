@@ -32,8 +32,6 @@ libloading = "0.8"
 # open tray via the kernel's autoclose behaviour.
 libc = "0.2"
 
-# Shared media types (Packet / StreamInfo / CodecParameters) used by the muxer API.
-oxideav-core = "0.1"
 
 [profile.release]
 lto = "thin"

@@ -1,8 +1,8 @@
-//! Map between Matroska codec ID strings and oxideav [`CodecId`].
+//! Map between Matroska codec ID strings and packrat [`CodecId`].
 //!
 //! Reference: <https://www.matroska.org/technical/codec_specs.html>
 
-use oxideav_core::CodecId;
+use crate::media::core::CodecId;
 
 /// Matroska CodecID strings that WebM permits.
 ///
@@ -24,14 +24,14 @@ pub fn is_webm_matroska_codec(matroska_codec_id: &str) -> bool {
     ALLOWED_WEBM_CODECS.contains(&matroska_codec_id)
 }
 
-/// Return true if the oxideav-internal [`CodecId`] corresponds to a codec
+/// Return true if the packrat-internal [`CodecId`] corresponds to a codec
 /// that WebM permits. Unknown / unmapped codec ids return false.
 pub fn is_webm_codec(id: &CodecId) -> bool {
     matches!(id.as_str(), "vp8" | "vp9" | "av1" | "vorbis" | "opus")
 }
 
 /// Best-effort mapping from a Matroska codec id string (e.g. `"A_FLAC"`) to
-/// the oxideav codec id we use internally.
+/// the packrat codec id we use internally.
 ///
 /// `codec_private` is consulted for `V_MS/VFW/FOURCC` tracks because the
 /// BITMAPINFOHEADER's `biCompression` field carries the actual codec. For
@@ -71,7 +71,7 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MS/VFW/FOURCC" => return from_bitmapinfoheader(codec_private),
         // Subtitles. Matroska's "S_TEXT/*" family carries plain UTF-8 with
         // per-format markup; "S_HDMV/PGS" carries Blu-ray bitmap subs;
-        // "S_VOBSUB" carries DVD bitmap subs. We map them to short oxideav
+        // "S_VOBSUB" carries DVD bitmap subs. We map them to short packrat
         // codec ids so downstream decoders / muxers can recognise the
         // format without parsing the Matroska string themselves.
         "S_TEXT/UTF8" => "subrip",
@@ -170,7 +170,7 @@ mod tests {
         let cid = from_matroska(matroska_id, &[]);
         let back = to_matroska(&cid).unwrap_or_else(|| {
             panic!(
-                "no inverse mapping for {matroska_id} → oxideav id {}",
+                "no inverse mapping for {matroska_id} → packrat id {}",
                 cid.as_str()
             )
         });
@@ -203,11 +203,11 @@ mod tests {
     }
 
     /// `A_DTS` and `A_TRUEHD` were added for BD passthrough. Locked
-    /// down so the oxideav-internal codec ids match the rest of the
+    /// down so the packrat-internal codec ids match the rest of the
     /// project's naming convention (lowercase, short canonical
     /// names).
     #[test]
-    fn dts_and_truehd_map_to_expected_oxideav_ids() {
+    fn dts_and_truehd_map_to_expected_packrat_ids() {
         assert_eq!(from_matroska("A_DTS", &[]).as_str(), "dts");
         assert_eq!(from_matroska("A_TRUEHD", &[]).as_str(), "truehd");
         assert_eq!(to_matroska(&CodecId::new("dts")), Some("A_DTS"));

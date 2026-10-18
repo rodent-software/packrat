@@ -27,8 +27,8 @@
 
 use std::io::Write;
 
-use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
-use oxideav_core::{Muxer, WriteSeek};
+use crate::media::core::{Error, MediaType, Packet, Result, StreamInfo};
+use crate::media::core::{Muxer, WriteSeek};
 
 use crate::mkv::codec_id;
 use crate::mkv::demux::{
@@ -4797,7 +4797,7 @@ impl MkvMuxer {
     /// auto-derives `Duration` from the written packets — doing so would need
     /// a trailer patch that invalidates the `Info` CRC. A caller that knows
     /// the total length ahead of time supplies it here; the value round-trips
-    /// through the demuxer's [`duration_micros`](oxideav_core::Demuxer::duration_micros).
+    /// through the demuxer's [`duration_micros`](crate::media::core::Demuxer::duration_micros).
     ///
     /// The muxer's `TimestampScale` is fixed at 1 ms, so the on-disk
     /// `Duration` float is the length in milliseconds; the argument is a
@@ -5153,8 +5153,8 @@ impl Muxer for MkvMuxer {
         if let Some(title) = &self.info_title {
             write_string_element(&mut info_body, ids::TITLE, title);
         }
-        write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
-        write_string_element(&mut info_body, ids::WRITING_APP, "oxideav");
+        write_string_element(&mut info_body, ids::MUXING_APP, "packrat");
+        write_string_element(&mut info_body, ids::WRITING_APP, "packrat");
         if self.webm_strict {
             // The guidelines list CRC-32 as unsupported.
             write_master_element(&mut all, ids::INFO, &info_body);
@@ -7217,7 +7217,7 @@ fn write_vint_fixed(value: u64, width: u8) -> Vec<u8> {
     out
 }
 
-fn pts_to_ms(value: i64, tb: oxideav_core::TimeBase) -> i64 {
+fn pts_to_ms(value: i64, tb: crate::media::core::TimeBase) -> i64 {
     let r = tb.as_rational();
     if r.den == 0 {
         return value;
@@ -7276,7 +7276,7 @@ fn parse_opus_pre_skip(extradata: &[u8]) -> u16 {
     u16::from_le_bytes([extradata[10], extradata[11]])
 }
 
-fn encode_codec_private(codec_id: &oxideav_core::CodecId, extradata: &[u8]) -> Vec<u8> {
+fn encode_codec_private(codec_id: &crate::media::core::CodecId, extradata: &[u8]) -> Vec<u8> {
     match codec_id.as_str() {
         // Matroska's A_FLAC mapping carries the leading "fLaC" magic in
         // CodecPrivate even though many docs imply it's optional. Common

@@ -1,4 +1,4 @@
-//! Print the file LBAs `oxideav-dvd` derives, for debugging the device path.
+//! Print the file LBAs packrat derives, for debugging the device path.
 //!
 //! UDF file entries carry an *in-partition* block number, so the partition's
 //! start sector has to be added to reach the disc. This prints that, reads the

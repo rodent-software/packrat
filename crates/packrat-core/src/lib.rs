@@ -14,7 +14,7 @@ pub mod dvdcss;
 pub mod error;
 pub mod identify;
 pub mod library;
-mod media;
+pub mod media;
 pub mod meta;
 mod mkv;
 pub mod movie;

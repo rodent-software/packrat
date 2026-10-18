@@ -7,11 +7,11 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_core::{
+use crate::media::core::{
     CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext, Result,
     SampleFormat, StreamInfo, TimeBase,
 };
-use oxideav_core::{Demuxer, ReadSeek};
+use crate::media::core::{Demuxer, ReadSeek};
 
 use crate::mkv::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::mkv::ebml::{
@@ -3291,7 +3291,7 @@ impl TargetLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetUid {
     /// Resolved `TagTrackUID` (RFC 9559 §5.1.8.1.1.3). `stream_index` is
-    /// 0-indexed, matching [`oxideav_core::StreamInfo::index`].
+    /// 0-indexed, matching [`crate::media::core::StreamInfo::index`].
     Track { stream_index: u32, track_uid: u64 },
     /// Resolved `TagEditionUID` (RFC 9559 §5.1.8.1.1.4). 1-indexed to
     /// match the flat `tag:edition:N:*` key convention.
@@ -3450,7 +3450,7 @@ impl TrackPlaneType {
 
 /// A reference to a track from within a [`TrackOperation`], keyed by
 /// `TrackUID`. The `stream_index` is the resolved 0-indexed position in
-/// [`Demuxer::streams`](oxideav_core::Demuxer::streams) when the UID
+/// [`Demuxer::streams`](crate::media::core::Demuxer::streams) when the UID
 /// matches a track in the same Segment, or `None` for a dangling
 /// reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10285,7 +10285,7 @@ impl MkvDemuxer {
     ///
     /// This is the typed companion to the flat [`StreamInfo::params`] view,
     /// which only lifts the effective language onto
-    /// [`CodecParameters::language`](oxideav_core::CodecParameters); the typed
+    /// [`CodecParameters::language`](crate::media::core::CodecParameters); the typed
     /// record additionally surfaces the human-readable names, both raw
     /// language forms, the selection flags, and the attachment link.
     pub fn track_identity(&self, stream_index: u32) -> Option<&TrackIdentity> {
